@@ -1,0 +1,72 @@
+[project]
+name = "bsky-starter-pack-block"
+version = "0.1.0"
+description = "Block all users from a Bluesky starter pack"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "atproto>=0.0.65",
+]
+
+[dependency-groups]
+dev = [
+ "basedpyright>=1.39.0",
+ "ruff>=0.2.2",
+ "vermin>=1.7.0",
+]
+
+[tool.ruff]
+line-length = 79
+target-version = "py312"
+src = ["bsky.py"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "EM",
+    "W",
+    "F",
+    "I",
+    "N",
+    "UP",
+    "B",
+    "A",
+    "C4",
+    "PIE",
+    "SIM",
+    "RET",
+    "ARG",
+    "EM",
+    "PTH",
+    "PL",
+    "RUF",
+    "S",
+    "BLE",
+    "ANN",
+    "ASYNC",
+    "PT",
+    "D101",
+    "D102",
+    "D103",
+]
+ignore = [
+    "E501",
+    "ISC001",
+    "COM812",
+    "D203",
+    "D213",
+    "ANN401",  # use Any in **kwargs
+    "PLR0913",
+    "PLR2004",
+    "S101",
+]
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+include = ["bsky.py"]
+exclude = ["**/__pycache__/**", ".venv"]
+stubPath = "stubs"
+typeCheckingMode = "recommended"
+reportUnusedCallResult = "none"
+reportExplicitAny = "none"
+reportAny = "none"
