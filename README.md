@@ -1,4 +1,4 @@
-# Bluesky Starter Pack Blocker
+# bsky-starter-pack-block
 
 Block every account listed in a Bluesky starter pack. The tool logs in with an app password, resolves your starter pack link to its backing list, loads the members, skips your own account and people you already block, then creates block records for the rest.
 
@@ -13,7 +13,7 @@ pip install -e .
 
 ## Setup
 
-1. In Bluesky: **Settings -> Privacy and security -> App passwords** — create an app password.
+1. In Bluesky: **Settings -> Privacy and security -> App passwords** - create an app password.
 2. Prefer passing it via environment (avoids shell history and process lists):
 
    ```bash
