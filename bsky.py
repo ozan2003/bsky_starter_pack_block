@@ -995,7 +995,6 @@ def main() -> None:
     )
 
     blocked_dids = fetch_blocked_dids(client)
-    print(f"Loaded {len(blocked_dids)} already-blocked accounts")
 
     summary, failures = block_users(
         client=client,
