@@ -1,4 +1,4 @@
-# bsky-starter-pack-block
+# Bluesky Starter Pack Blocker
 
 Block every account listed in a Bluesky starter pack. The tool logs in with an app password, resolves your starter pack link to its backing list, loads the members, skips your own account and people you already block, then creates block records for the rest.
 
