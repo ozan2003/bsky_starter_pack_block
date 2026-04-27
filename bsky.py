@@ -64,7 +64,7 @@ BASE_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 8.0
 
 
-@dataclass
+@dataclass(slots=True)
 class Member:
     """Starter pack member selected for possible blocking.
 
@@ -77,7 +77,7 @@ class Member:
     handle: str
 
 
-@dataclass
+@dataclass(slots=True)
 class BlockSummary:
     """Counters collected while processing starter pack members.
 
@@ -102,7 +102,7 @@ class BlockSummary:
     retries: int = 0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PackReference:
     """Canonical starter pack reference before DID normalization.
 
@@ -115,7 +115,7 @@ class PackReference:
     rkey: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ShortStarterPackLink:
     """Bluesky short link that must be resolved before API use.
 
@@ -854,6 +854,19 @@ def is_transient_error(error: Exception) -> bool:
     return "rate limit" in text or "temporarily unavailable" in text
 
 
+@dataclass(slots=True)
+class BlockResult:
+    """Result of the blocking operations.
+
+    Attributes:
+        summary: Summary of the blocking operations.
+        failures: Human-readable failure entries.
+    """
+
+    summary: BlockSummary
+    failures: list[str]
+
+
 def block_users(
     client: Client,
     users: list[Member],
@@ -861,7 +874,7 @@ def block_users(
     blocked_dids: set[str],
     delay: float,
     dry_run: bool,
-) -> tuple[BlockSummary, list[str]]:
+) -> BlockResult:
     """Block each eligible starter pack member.
 
     Args:
@@ -937,19 +950,19 @@ def block_users(
             if delay > 0:
                 time.sleep(delay)
 
-    return summary, failures
+    return BlockResult(summary=summary, failures=failures)
 
 
-def print_summary(
-    summary: BlockSummary, failures: list[str], dry_run: bool
-) -> None:
+def print_summary(result: BlockResult, dry_run: bool) -> None:
     """Print the run summary and any failed entries.
 
     Args:
-        summary: Counters collected while processing users.
-        failures: Human-readable failure entries.
+        result: Result of the blocking operations.
         dry_run: Whether the run was executed in dry-run mode.
     """
+
+    summary = result.summary
+    failures = result.failures
 
     print("\nSummary")
     print(f"Members discovered: {summary.discovered}")
@@ -996,7 +1009,7 @@ def main() -> None:
 
     blocked_dids = fetch_blocked_dids(client)
 
-    summary, failures = block_users(
+    result = block_users(
         client=client,
         users=users,
         self_did=self_did,
@@ -1004,9 +1017,9 @@ def main() -> None:
         delay=args.delay,
         dry_run=args.dry_run,
     )
-    print_summary(summary, failures, args.dry_run)
+    print_summary(result, args.dry_run)
 
-    if summary.failed > 0:
+    if result.summary.failed > 0:
         raise SystemExit(1)
 
 
