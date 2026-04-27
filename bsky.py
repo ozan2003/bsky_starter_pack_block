@@ -39,8 +39,9 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from math import isinf, isnan
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -238,13 +239,13 @@ def as_dict(value: object) -> dict[str, object]:
     """
 
     if isinstance(value, dict):
-        return value
+        return cast(dict[str, object], value)
 
     model_dump = getattr(value, "model_dump", None)
     if callable(model_dump):
         dumped = model_dump(by_alias=True)
         if isinstance(dumped, dict):
-            return dumped
+            return cast(dict[str, object], dumped)
 
     dict_method = getattr(value, "dict", None)
     if callable(dict_method):
@@ -253,10 +254,10 @@ def as_dict(value: object) -> dict[str, object]:
         except TypeError:
             dumped = dict_method()
         if isinstance(dumped, dict):
-            return dumped
+            return cast(dict[str, object], dumped)
 
     if hasattr(value, "__dict__"):
-        return dict(vars(value))
+        return cast(dict[str, object], dict(vars(value)))
 
     msg = f"Unexpected response type: {type(value)!r}"
     raise TypeError(msg)
@@ -350,14 +351,18 @@ def parse_short_pack_path(
         return None
 
     if host == BSKY_SHORT_LINK_HOST and len(parts) == 1:
-        return ShortStarterPackLink(url=f"https://{BSKY_SHORT_LINK_HOST}/{parts[0]}")
+        return ShortStarterPackLink(
+            url=f"https://{BSKY_SHORT_LINK_HOST}/{parts[0]}"
+        )
 
     if (
         host in BSKY_APP_HOSTS
         and len(parts) == 2
         and parts[0] == STARTER_PACK_SHORT_PATH
     ):
-        return ShortStarterPackLink(url=f"https://{BSKY_SHORT_LINK_HOST}/{parts[1]}")
+        return ShortStarterPackLink(
+            url=f"https://{BSKY_SHORT_LINK_HOST}/{parts[1]}"
+        )
 
     return None
 
@@ -395,7 +400,10 @@ def parse_pack_input(pack_input: str) -> PackInput:
     if parsed.scheme and parsed.scheme not in {"http", "https"}:
         raise ValueError(starter_pack_format_error())
 
-    if host is not None and host not in {*BSKY_APP_HOSTS, BSKY_SHORT_LINK_HOST}:
+    if host is not None and host not in {
+        *BSKY_APP_HOSTS,
+        BSKY_SHORT_LINK_HOST,
+    }:
         msg = f"Unsupported starter pack URL host: {host}"
         raise ValueError(msg)
 
@@ -460,10 +468,12 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
             body = response.read()
             content_type = response.headers.get("content-type", "")
             if body and "application/json" in content_type:
-                data = json.loads(body.decode("utf-8"))
-                url = data.get("url") if isinstance(data, dict) else None
-                if isinstance(url, str) and url:
-                    return url
+                raw = json.loads(body.decode("utf-8"))
+                if isinstance(raw, dict):
+                    payload = cast(dict[str, object], raw)
+                    url = payload.get("url")
+                    if isinstance(url, str) and url:
+                        return url
 
             # Keep a redirect fallback for clients or environments where the
             # service responds with a normal HTTP redirect instead of JSON.
@@ -595,12 +605,14 @@ def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
         msg = "Starter pack response is missing starterPack data"
         raise RuntimeError(msg)
 
-    list_view = starter_pack.get("list")
+    starter_pack_dict = cast(dict[str, object], starter_pack)
+    list_view = starter_pack_dict.get("list")
     if not isinstance(list_view, dict):
         msg = "Starter pack does not expose a backing list"
         raise RuntimeError(msg)
 
-    list_uri = list_view.get("uri")
+    list_view_dict = cast(dict[str, object], list_view)
+    list_uri = list_view_dict.get("uri")
     if not isinstance(list_uri, str) or not list_uri:
         msg = "Starter pack list URI is missing"
         raise RuntimeError(msg)
@@ -638,7 +650,8 @@ def fetch_members(client: Client, at_uri: str) -> list[Member]:
             msg = "List response is missing items"
             raise RuntimeError(msg)
 
-        for item in items:
+        list_items = cast(list[object], items)
+        for item in list_items:
             item_dict = as_dict(item)
             subject = item_dict.get("subject")
             if subject is None:
@@ -693,7 +706,8 @@ def fetch_blocked_dids(client: Client) -> set[str]:
             msg = "Blocks response is missing blocks"
             raise RuntimeError(msg)
 
-        for block in blocks:
+        block_items = cast(list[object], blocks)
+        for block in block_items:
             block_dict = as_dict(block)
             did = block_dict.get("did")
             if isinstance(did, str) and did:
@@ -725,7 +739,7 @@ def current_time_iso(client: Client) -> str:
         if isinstance(value, str) and value:
             return value
 
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def create_block_record(client: Client, did: str) -> None:
@@ -750,10 +764,11 @@ def create_block_record(client: Client, did: str) -> None:
         msg = "Unable to determine repo DID for block operation"
         raise RuntimeError(msg)
 
-    record = models.AppBskyGraphBlock.Record(
-        subject=did,
-        created_at=current_time_iso(client),
-    )
+    record_data: dict[str, str] = {
+        "subject": did,
+        "created_at": current_time_iso(client),
+    }
+    record = models.AppBskyGraphBlock.Record.model_validate(record_data)
     client.app.bsky.graph.block.create(
         repo_did,
         record,
@@ -875,7 +890,10 @@ def block_users(
                 success = True
                 break
             except Exception as error:  # noqa: BLE001
-                if not is_transient_error(error) or attempt == MAX_BLOCK_RETRIES:
+                if (
+                    not is_transient_error(error)
+                    or attempt == MAX_BLOCK_RETRIES
+                ):
                     error_text = describe_error(error)
                     summary.failed += 1
                     failures.append(f"{handle} ({did}) -> {error_text}")
@@ -904,7 +922,9 @@ def block_users(
     return summary, failures
 
 
-def print_summary(summary: BlockSummary, failures: list[str], dry_run: bool) -> None:
+def print_summary(
+    summary: BlockSummary, failures: list[str], dry_run: bool
+) -> None:
     """Print the run summary and any failed entries.
 
     Args:
