@@ -1,6 +1,6 @@
 # Bluesky Starter Pack Blocker
 
-Block every account listed in a Bluesky starter pack. The tool logs in with an app password, resolves your starter pack link to its backing list, loads the members, skips your own account and people you already block, then creates block records for the rest.
+Block every account listed in one or more Bluesky starter packs. The tool logs in with an app password, resolves each pack link to its backing list, loads the members, merges them into a **unique** set of accounts (by DID), skips your own account and people you already block, then creates block records for the rest.
 
 **Requirements:** Python 3.12 or newer.
 
@@ -26,6 +26,12 @@ Run a **dry run** first (no blocks are created):
 
 ```bash
 python3 bsky.py --handle your.handle.bsky.social --pack <starter-pack-link> --dry-run
+```
+
+Use more than one pack by passing several URLs (or AT URIs) after `--pack` (the union of members, deduplicated by account):
+
+```bash
+python3 bsky.py --handle your.handle.bsky.social --pack <pack-url-1> <pack-url-2> --dry-run
 ```
 
 If the output looks right, run without `--dry-run`:

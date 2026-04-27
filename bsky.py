@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Block every account listed in a Bluesky starter pack.
+"""Block every account listed in one or more Bluesky starter packs.
 
-This script logs in to Bluesky with an app password, resolves a starter pack
-link to its backing list, loads every account in that list, skips your own
-account and accounts you already block, then creates block records for the
-remaining accounts.
+This script logs in to Bluesky with an app password, resolves each starter
+pack input to a backing list, loads every account across those lists (merging
+unique members by account), skips your own account and accounts you already
+block, then creates block records for the remaining accounts.
 
 Supported starter pack inputs:
     - ``at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>``
@@ -22,11 +22,14 @@ Usage:
 
     Run a dry run before blocking:
 
-    ``python3 bsky.py --handle user.bsky.social --pack <starter-pack-link> --dry-run``
+    ``python3 bsky.py --handle user.bsky.social --pack <url-or-at-uri> --dry-run``
+
+    Pass more than one pack (space-separated); members are the union, deduplicated
+    by account: ``--pack <url1> <url2>``.
 
     If the dry run looks correct, run without ``--dry-run``:
 
-    ``python3 bsky.py --handle user.bsky.social --pack <starter-pack-link>``
+    ``python3 bsky.py --handle user.bsky.social --pack <url-or-at-uri>``
 
     You can pass ``--delay`` to control the pause between block operations.
     ``--app-password`` is supported, but the environment variable is safer.
@@ -154,12 +157,12 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line options.
 
     Returns:
-        Parsed command-line arguments for login, starter pack selection,
-        throttling, and dry-run mode.
+        Parsed command-line arguments for login, one or more starter pack
+        inputs, throttling, and dry-run mode.
     """
 
     parser = argparse.ArgumentParser(
-        description="Block all users from a Bluesky starter pack",
+        description="Block all users from one or more Bluesky starter packs",
     )
 
     parser.add_argument(
@@ -180,7 +183,8 @@ def parse_args() -> argparse.Namespace:
         "--pack",
         required=True,
         type=str,
-        help="Starter pack URL or AT URI",
+        nargs="+",
+        help="One or more starter pack URLs or AT URIs; members are merged (unique by account)",
     )
 
     parser.add_argument(
@@ -679,6 +683,20 @@ def fetch_members(client: Client, at_uri: str) -> list[Member]:
     return list(members_by_did.values())
 
 
+def merge_unique_members(
+    merged: dict[str, Member], new_members: list[Member]
+) -> None:
+    """Add members into ``merged``, keeping the first handle seen per DID.
+
+    Args:
+        merged: Mapping from account DID to member, updated in place.
+        new_members: Members to insert when their DID is not already present.
+    """
+
+    for member in new_members:
+        merged.setdefault(member.did, member)
+
+
 def fetch_blocked_dids(client: Client) -> set[str]:
     """Load all DIDs already blocked by the signed-in account.
 
@@ -963,11 +981,18 @@ def main() -> None:
 
     app_password = resolve_app_password(args.app_password)
     client, self_did = login(args.handle, app_password)
-    at_uri = normalize_starter_pack_uri(client, args.pack)
-    print(f"Using starter pack {at_uri}")
 
-    users = fetch_members(client, at_uri)
-    print(f"Loaded {len(users)} unique starter pack members")
+    merged: dict[str, Member] = {}
+    for pack_input in args.pack:
+        at_uri = normalize_starter_pack_uri(client, pack_input)
+        print(f"Using starter pack {at_uri}")
+        pack_members = fetch_members(client, at_uri)
+        print(f"\t- Loaded {len(pack_members)} members from this pack")
+        merge_unique_members(merged, pack_members)
+    users = list(merged.values())
+    print(
+        f"Loaded {len(users)} unique members across {len(args.pack)} starter pack(s)"
+    )
 
     blocked_dids = fetch_blocked_dids(client)
     print(f"Loaded {len(blocked_dids)} already-blocked accounts")
