@@ -3,17 +3,12 @@ name = "bsky-starter-pack-block"
 version = "0.1.0"
 description = "Block all users from a Bluesky starter pack"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12"
-dependencies = [
-    "atproto>=0.0.65",
-]
+dependencies = ["atproto>=0.0.65"]
 
 [dependency-groups]
-dev = [
- "basedpyright>=1.39.0",
- "ruff>=0.2.2",
- "vermin>=1.7.0",
-]
+dev = ["basedpyright>=1.39.0", "ruff>=0.2.2", "vermin>=1.7.0"]
 
 [tool.ruff]
 line-length = 79
