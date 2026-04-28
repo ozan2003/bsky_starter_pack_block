@@ -57,13 +57,32 @@ SUPPORTED_STARTER_PACK_PATHS = {"start", "starter-pack"}
 BSKY_APP_HOSTS = {"bsky.app", "www.bsky.app"}
 BSKY_SHORT_LINK_HOST = "go.bsky.app"
 STARTER_PACK_SHORT_PATH = "starter-pack-short"
+
+# Socket timeout for urllib when resolving short links (go.bsky.app redirects).
 SHORT_LINK_TIMEOUT_SECONDS = 10.0
+
+# Maximum records per page for listRepos/listRecords-style reads.
 LIST_PAGE_SIZE = 100
-JITTER_SECONDS = (0.0, 0.6)  # seconds
+
+# Same pagination limit when enumerating existing blocks to skip already-blocked DIDs.
 BLOCKS_PAGE_SIZE = 100
-MAX_BLOCK_RETRIES = 4
-BASE_BACKOFF_SECONDS = 1.0
+
+# Successful blocks are followed by ``time.sleep(delay)``, CLI default when ``--delay`` omitted.
+DEFAULT_DELAY_SECONDS = 0.5
+
+# Retries after transient failures in ``block_users`` use capped exponential backoff + jitter.
+MAX_BLOCK_RETRIES = 4  # Highest ``attempt`` index allowed before giving up (matches ``while attempt <= ...``).
+BASE_BACKOFF_SECONDS = 1.0  # Wait ``min(MAX, BASE * 2**(attempt - 1))`` seconds before each retry.
+# Upper bound so backoff does not grow past a lot.
 MAX_BACKOFF_SECONDS = 8.0
+
+# Uniform random extra delay on each backoff (seconds), reduces synchronized retries.
+JITTER_SECONDS = (0.0, 0.6)
+
+# HTTP response codes treated as retryable alongside network errors (see ``is_transient_error``).
+HTTP_STATUS_TOO_MANY_REQUESTS = 429
+# Any status greater than or equal to this is treated as a transient server error.
+HTTP_STATUS_SERVER_ERROR_MIN = 500
 # User agent is initialized once at invocation.
 USER_AGENT = choice(
     (
@@ -207,7 +226,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--delay",
         type=parse_delay,
-        default=0.5,
+        default=DEFAULT_DELAY_SECONDS,
         help="Delay between blocks (seconds)",
     )
 
@@ -788,9 +807,12 @@ def is_transient_error(error: Exception) -> bool:
         return True
 
     status_code = extract_status_code(error)
-    if status_code == 429:
+    if status_code == HTTP_STATUS_TOO_MANY_REQUESTS:
         return True
-    if isinstance(status_code, int) and status_code >= 500:
+    if (
+        isinstance(status_code, int)
+        and status_code >= HTTP_STATUS_SERVER_ERROR_MIN
+    ):
         return True
 
     text = str(error).lower()
