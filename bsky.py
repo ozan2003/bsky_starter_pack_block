@@ -43,6 +43,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from random import choice
 from math import isinf, isnan
 from typing import cast
 from urllib.error import HTTPError, URLError
@@ -62,6 +63,21 @@ BLOCKS_PAGE_SIZE = 100
 MAX_BLOCK_RETRIES = 4
 BASE_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 8.0
+# User agent is initialized once at invocation.
+USER_AGENT = choice(
+    (
+        "Mozilla/5.0 (Windows NT 6.2) AppleWebKit/531.2 (KHTML, like Gecko) Chrome/35.0.862.0 Safari/531.2",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_1 rv:5.0; ja-JP) AppleWebKit/535.6.1 (KHTML, like Gecko) Version/5.0.3 Safari/535.6.1",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/535.1 (KHTML, like Gecko) Chrome/32.0.816.0 Safari/535.1",
+        "Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_11_7) AppleWebKit/533.2 (KHTML, like Gecko) Chrome/58.0.898.0 Safari/533.2",
+        "Mozilla/5.0 (compatible; MSIE 7.0; Windows NT 5.2; Trident/5.0)",
+        "Opera/9.24.(Windows NT 6.2; sa-IN) Presto/2.9.172 Version/10.00",
+        "Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_6; rv:1.9.4.20) Gecko/6174-02-20 01:19:12.425873 Firefox/7.0",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:1.9.7.20) Gecko/8960-12-16 18:15:36.475525 Firefox/3.8",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_8_5 rv:6.0; kl-GL) AppleWebKit/532.19.4 (KHTML, like Gecko) Version/5.0.1 Safari/532.19.4",
+        "Mozilla/5.0 (Linux; Android 2.3.5) AppleWebKit/534.1 (KHTML, like Gecko) Chrome/56.0.885.0 Safari/534.1",
+    )
+)
 
 
 @dataclass(slots=True)
@@ -420,11 +436,11 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
 
     # Bluesky's short-link service returns JSON when requested with this Accept
     # header. That avoids scraping HTML and gives us the canonical bsky.app URL.
-    request = Request(  # noqa: S310
+    request = Request(
         short_link.url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "bsky-starter-pack-blocker/1.0",
+            "User-Agent": USER_AGENT,
         },
     )
 
