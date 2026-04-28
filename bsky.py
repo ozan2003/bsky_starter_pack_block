@@ -43,8 +43,8 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from random import choice
 from math import isinf, isnan
+from random import choice, uniform
 from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -59,6 +59,7 @@ BSKY_SHORT_LINK_HOST = "go.bsky.app"
 STARTER_PACK_SHORT_PATH = "starter-pack-short"
 SHORT_LINK_TIMEOUT_SECONDS = 10.0
 LIST_PAGE_SIZE = 100
+JITTER_SECONDS = (0.0, 0.6)  # seconds
 BLOCKS_PAGE_SIZE = 100
 MAX_BLOCK_RETRIES = 4
 BASE_BACKOFF_SECONDS = 1.0
@@ -436,7 +437,7 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
 
     # Bluesky's short-link service returns JSON when requested with this Accept
     # header. That avoids scraping HTML and gives us the canonical bsky.app URL.
-    request = Request(
+    request = Request(  # noqa: S310
         short_link.url,
         headers={
             "Accept": "application/json",
@@ -879,7 +880,7 @@ def block_users(
                     MAX_BACKOFF_SECONDS,
                     BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)),
                 )
-                wait_seconds = backoff
+                wait_seconds = backoff + uniform(*JITTER_SECONDS)
                 print(
                     f"WARN transient error for {handle} ({did}); retry {attempt}/{MAX_BLOCK_RETRIES} in {wait_seconds:.2f}s"
                 )
