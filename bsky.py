@@ -228,45 +228,6 @@ def resolve_app_password(cli_password: str | None) -> str:
     raise ValueError(msg)
 
 
-def as_dict(value: object) -> dict[str, object]:
-    """Convert SDK model-like values to plain dictionaries.
-
-    Args:
-        value: A dictionary, Pydantic model, SDK model, or object with
-            attributes.
-
-    Returns:
-        A plain dictionary representation of ``value``.
-
-    Raises:
-        TypeError: If ``value`` cannot be represented as a dictionary.
-    """
-
-    if isinstance(value, dict):
-        return cast(dict[str, object], value)
-
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump(by_alias=True)
-        if isinstance(dumped, dict):
-            return cast(dict[str, object], dumped)
-
-    dict_method = getattr(value, "dict", None)
-    if callable(dict_method):
-        try:
-            dumped = dict_method(by_alias=True)
-        except TypeError:
-            dumped = dict_method()
-        if isinstance(dumped, dict):
-            return cast(dict[str, object], dumped)
-
-    if hasattr(value, "__dict__"):
-        return cast(dict[str, object], dict(vars(value)))
-
-    msg = f"Unexpected response type: {type(value)!r}"
-    raise TypeError(msg)
-
-
 def starter_pack_format_error() -> str:
     """Build the supported starter pack input error message.
 
@@ -513,10 +474,8 @@ def resolve_identifier_to_did(client: Client, identifier: str) -> str:
         return identifier
 
     response = client.resolve_handle(identifier)
-    response_dict = as_dict(response)
-    did = response_dict.get("did")
-    if isinstance(did, str) and did:
-        return did
+    if response.did:
+        return response.did
 
     msg = f"Could not resolve handle to DID: {identifier}"
     raise RuntimeError(msg)
@@ -574,9 +533,8 @@ def login(handle: str, app_password: str) -> tuple[Client, str]:
     client = Client()
     profile = client.login(handle, app_password)
 
-    profile_dict = as_dict(profile)
-    did = profile_dict.get("did")
-    if not isinstance(did, str) or not did:
+    did = profile.did
+    if not did:
         did = getattr(getattr(client, "me", None), "did", None)
 
     if not isinstance(did, str) or not did:
@@ -602,22 +560,16 @@ def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
     """
 
     params = models.AppBskyGraphGetStarterPack.Params(starter_pack=at_uri)
-    response = as_dict(client.app.bsky.graph.get_starter_pack(params))
+    response = client.app.bsky.graph.get_starter_pack(params)
 
-    starter_pack = response.get("starterPack")
-    if not isinstance(starter_pack, dict):
-        msg = "Starter pack response is missing starterPack data"
-        raise RuntimeError(msg)
-
-    starter_pack_dict = cast(dict[str, object], starter_pack)
-    list_view = starter_pack_dict.get("list")
-    if not isinstance(list_view, dict):
+    starter_pack = response.starter_pack
+    list_view = starter_pack.list
+    if list_view is None:
         msg = "Starter pack does not expose a backing list"
         raise RuntimeError(msg)
 
-    list_view_dict = cast(dict[str, object], list_view)
-    list_uri = list_view_dict.get("uri")
-    if not isinstance(list_uri, str) or not list_uri:
+    list_uri = list_view.uri
+    if not list_uri:
         msg = "Starter pack list URI is missing"
         raise RuntimeError(msg)
 
@@ -635,7 +587,8 @@ def fetch_members(client: Client, at_uri: str) -> list[Member]:
         Unique starter pack members keyed by DID.
 
     Raises:
-        RuntimeError: If the list API response is missing its items array.
+        RuntimeError: If the backing list URI cannot be resolved
+            (see ``fetch_starter_pack_list_uri``).
     """
 
     list_uri = fetch_starter_pack_list_uri(client, at_uri)
@@ -648,34 +601,18 @@ def fetch_members(client: Client, at_uri: str) -> list[Member]:
             limit=LIST_PAGE_SIZE,
             cursor=cursor,
         )
-        response = as_dict(client.app.bsky.graph.get_list(params))
-        items = response.get("items")
-        if not isinstance(items, list):
-            msg = "List response is missing items"
-            raise RuntimeError(msg)
-
-        list_items = cast(list[object], items)
-        for item in list_items:
-            item_dict = as_dict(item)
-            subject = item_dict.get("subject")
-            if subject is None:
+        response = client.app.bsky.graph.get_list(params)
+        for item in response.items:
+            subject = item.subject
+            did = subject.did
+            if not did:
                 continue
 
-            subject_dict = as_dict(subject)
-            did = subject_dict.get("did")
-            if not isinstance(did, str) or not did:
-                continue
-
-            handle_value = subject_dict.get("handle")
-            handle = (
-                handle_value
-                if isinstance(handle_value, str) and handle_value
-                else "<unknown>"
-            )
+            handle = subject.handle if subject.handle else "<unknown>"
             members_by_did.setdefault(did, Member(did=did, handle=handle))
 
-        next_cursor = response.get("cursor")
-        if isinstance(next_cursor, str) and next_cursor:
+        next_cursor = response.cursor
+        if next_cursor:
             cursor = next_cursor
             continue
         break
@@ -705,9 +642,6 @@ def fetch_blocked_dids(client: Client) -> set[str]:
 
     Returns:
         DIDs for accounts that are already blocked.
-
-    Raises:
-        RuntimeError: If the blocks API response is missing its blocks array.
     """
 
     blocked_dids: set[str] = set()
@@ -718,21 +652,13 @@ def fetch_blocked_dids(client: Client) -> set[str]:
             limit=BLOCKS_PAGE_SIZE,
             cursor=cursor,
         )
-        response = as_dict(client.app.bsky.graph.get_blocks(params))
-        blocks = response.get("blocks")
-        if not isinstance(blocks, list):
-            msg = "Blocks response is missing blocks"
-            raise RuntimeError(msg)
+        response = client.app.bsky.graph.get_blocks(params)
+        for block in response.blocks:
+            if block.did:
+                blocked_dids.add(block.did)
 
-        block_items = cast(list[object], blocks)
-        for block in block_items:
-            block_dict = as_dict(block)
-            did = block_dict.get("did")
-            if isinstance(did, str) and did:
-                blocked_dids.add(did)
-
-        next_cursor = response.get("cursor")
-        if isinstance(next_cursor, str) and next_cursor:
+        next_cursor = response.cursor
+        if next_cursor:
             cursor = next_cursor
             continue
         break
