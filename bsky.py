@@ -24,8 +24,11 @@ Usage:
 
     ``python3 bsky.py --handle user.bsky.social --pack <url-or-at-uri> --dry-run``
 
-    Pass more than one pack (space-separated); members are the union, deduplicated
-    by account: ``--pack <url1> <url2>``.
+    Or load pack inputs from a file (one input per line):
+
+    ``python3 bsky.py --handle user.bsky.social --pack-file packs.txt --dry-run``
+
+    ``--pack`` and ``--pack-file`` are mutually exclusive.
 
     If the dry run looks correct, run without ``--dry-run``:
 
@@ -44,6 +47,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isinf, isnan
+from pathlib import Path
 from random import choice, uniform
 from typing import cast
 from urllib.error import HTTPError, URLError
@@ -215,12 +219,18 @@ def parse_args() -> argparse.Namespace:
         help="Bluesky app password (or set BSKY_APP_PASSWORD)",
     )
 
-    parser.add_argument(
+    pack_input_group = parser.add_mutually_exclusive_group(required=True)
+
+    pack_input_group.add_argument(
         "--pack",
-        required=True,
         type=str,
-        nargs="+",
-        help="One or more starter pack URLs or AT URIs; members are merged (unique by account)",
+        help="Single starter pack URL or AT URI",
+    )
+
+    pack_input_group.add_argument(
+        "--pack-file",
+        type=str,
+        help="Path to a UTF-8 text file with one starter pack URL or AT URI per line",
     )
 
     parser.add_argument(
@@ -237,6 +247,41 @@ def parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+def load_pack_inputs_from_file(path: str) -> list[str]:
+    """Load starter pack inputs from a UTF-8 text file.
+
+    Note that it won't do any normalization or validation of the inputs.
+    Refer to ``normalize_starter_pack_uri`` for more information.
+
+    Args:
+        path: File path containing one starter pack input per line.
+
+    Returns:
+        Non-empty starter pack input lines with surrounding whitespace removed.
+
+    Raises:
+        ValueError: If the file cannot be read or contains no usable pack lines.
+    """
+
+    pack_file_path = Path(path)
+    try:
+        with pack_file_path.open(encoding="utf-8") as pack_file:
+            pack_inputs = [
+                stripped for line in pack_file if (stripped := line.strip())
+            ]
+    except OSError as error:
+        msg = f"Could not read pack file {pack_file_path}: {error}"
+        raise ValueError(msg) from error
+
+    if pack_inputs:
+        return pack_inputs
+
+    msg = (
+        f"Pack file {pack_file_path} does not contain any starter pack inputs"
+    )
+    raise ValueError(msg)
 
 
 def resolve_app_password(cli_password: str | None) -> str:
@@ -960,8 +1005,14 @@ def main() -> None:
     app_password = resolve_app_password(args.app_password)
     client, self_did = login(args.handle, app_password)
 
+    pack_inputs: list[str]
+    if args.pack is not None:
+        pack_inputs = [args.pack]
+    else:
+        pack_inputs = load_pack_inputs_from_file(args.pack_file)
+
     merged: dict[str, Member] = {}
-    for pack_input in args.pack:
+    for pack_input in pack_inputs:
         at_uri = normalize_starter_pack_uri(client, pack_input)
         print(f"Using starter pack {at_uri}")
         pack_members = fetch_members(client, at_uri)
@@ -969,7 +1020,7 @@ def main() -> None:
         merge_unique_members(merged, pack_members)
     users = list(merged.values())
     print(
-        f"Loaded {len(users)} unique members across {len(args.pack)} starter pack(s)"
+        f"Loaded {len(users)} unique members across {len(pack_inputs)} starter pack(s)"
     )
 
     blocked_dids = fetch_blocked_dids(client)
