@@ -1041,6 +1041,175 @@ class BlockResult:
     failures: list[str]
 
 
+def _record_block_failure(
+    *,
+    summary: BlockSummary,
+    failures: list[str],
+    user: Member,
+    error: Exception,
+    is_verbose: bool,
+) -> None:
+    """Record and print a failed block attempt.
+
+    Args:
+        summary: Mutable run summary updated with the failure count.
+        failures: Mutable list receiving a human-readable failed account entry.
+        user: Starter pack member whose block attempt failed.
+        error: Exception raised by the block operation.
+        is_verbose: When ``True``, include the described error in output.
+    """
+
+    error_text = describe_error(error)
+    summary.failed += 1
+    failures.append(f"{user.handle} ({user.did})")
+    if is_verbose:
+        print(f"ERROR {user.handle} ({user.did}) -> {error_text}")
+    else:
+        print(f"ERROR {user.handle} ({user.did})")
+
+
+def _pause_for_rate_limit_if_needed(
+    *,
+    error: Exception,
+    user: Member,
+    summary: BlockSummary,
+    failures: list[str],
+) -> bool | None:
+    """Pause for a rate-limit response when retry timing is available.
+
+    Args:
+        error: Exception raised by the block operation.
+        user: Starter pack member being blocked.
+        summary: Mutable run summary updated with retry or failure counts.
+        failures: Mutable list receiving a failed account entry when the
+            rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT_SECONDS``.
+
+    Returns:
+        ``True`` when the caller should retry immediately after the pause,
+        ``False`` when the wait was too long and the user was recorded as
+        failed, or ``None`` when the error is not a usable rate-limit response.
+    """
+
+    status_code = extract_status_code(error)
+    if status_code != HTTP_STATUS_TOO_MANY_REQUESTS:
+        return None
+
+    rate_limit_wait = extract_rate_limit_wait(error)
+    if rate_limit_wait is None:
+        return None
+
+    if rate_limit_wait > RATE_LIMIT_MAX_WAIT_SECONDS:
+        resume_at = datetime.fromtimestamp(
+            time.time() + rate_limit_wait,
+            tz=UTC,
+        ).isoformat()
+        print(
+            f"ERROR rate limit for {user.handle} ({user.did}) resets at {resume_at}"
+            + f" ({rate_limit_wait:.0f}s), exceeds max wait of"
+            + f" {RATE_LIMIT_MAX_WAIT_SECONDS:.0f}s — aborting"
+        )
+        summary.failed += 1
+        failures.append(f"{user.handle} ({user.did})")
+        return False
+
+    resume_at = datetime.fromtimestamp(
+        time.time() + rate_limit_wait,
+        tz=UTC,
+    ).isoformat()
+    print(
+        f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait:.0f}s)..."
+    )
+    time.sleep(rate_limit_wait)
+    summary.retries += 1
+    return True
+
+
+def _pause_before_block_retry(
+    *,
+    attempt: int,
+    user: Member,
+    summary: BlockSummary,
+) -> None:
+    """Sleep before retrying a transient block failure.
+
+    Args:
+        attempt: One-based retry attempt number.
+        user: Starter pack member being blocked.
+        summary: Mutable run summary updated with the retry count.
+    """
+
+    summary.retries += 1
+    backoff = min(
+        MAX_BACKOFF_SECONDS,
+        BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+    )
+    wait_seconds = backoff + uniform(*JITTER_SECONDS)
+    print(
+        f"WARN transient error for {user.handle} ({user.did}); retry "
+        + f"{attempt}/{MAX_BLOCK_RETRIES} in {wait_seconds:.2f}s"
+    )
+    time.sleep(wait_seconds)
+
+
+def _block_user_with_retries(
+    *,
+    client: Client,
+    user: Member,
+    summary: BlockSummary,
+    failures: list[str],
+    is_verbose: bool,
+) -> bool:
+    """Block one user, retrying transient failures.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        user: Starter pack member to block.
+        summary: Mutable run summary updated with retries and failures.
+        failures: Mutable list receiving failed account entries.
+        is_verbose: When ``True``, include detailed error text in failure
+            output.
+
+    Returns:
+        ``True`` when the block record was created, otherwise ``False``.
+    """
+
+    attempt = 0
+    while attempt <= MAX_BLOCK_RETRIES:
+        try:
+            create_block_record(client, user.did)
+            return True
+        except Exception as error:  # noqa: BLE001
+            if not is_transient_error(error) or attempt == MAX_BLOCK_RETRIES:
+                _record_block_failure(
+                    summary=summary,
+                    failures=failures,
+                    user=user,
+                    error=error,
+                    is_verbose=is_verbose,
+                )
+                return False
+
+            rate_limit_result = _pause_for_rate_limit_if_needed(
+                error=error,
+                user=user,
+                summary=summary,
+                failures=failures,
+            )
+            if rate_limit_result is False:
+                return False
+            if rate_limit_result is True:
+                continue
+
+            attempt += 1
+            _pause_before_block_retry(
+                attempt=attempt,
+                user=user,
+                summary=summary,
+            )
+
+    return False
+
+
 def block_users(
     client: Client,
     *,
@@ -1091,70 +1260,13 @@ def block_users(
                 print(f"DRY BLOCK {handle} ({did})")
             continue
 
-        has_succeeded = False
-        attempt = 0
-        while attempt <= MAX_BLOCK_RETRIES:
-            try:
-                create_block_record(client, did)
-                has_succeeded = True
-                break
-            except Exception as error:  # noqa: BLE001
-                if (
-                    not is_transient_error(error)
-                    or attempt == MAX_BLOCK_RETRIES
-                ):
-                    error_text = describe_error(error)
-                    summary.failed += 1
-                    failures.append(f"{handle} ({did})")
-                    if is_verbose:
-                        print(f"ERROR {handle} ({did}) -> {error_text}")
-                    else:
-                        print(f"ERROR {handle} ({did})")
-                    break
-
-                status_code = extract_status_code(error)
-                is_rate_limited = status_code == HTTP_STATUS_TOO_MANY_REQUESTS
-
-                if is_rate_limited:
-                    rate_limit_wait = extract_rate_limit_wait(error)
-                    if rate_limit_wait is not None:
-                        if rate_limit_wait > RATE_LIMIT_MAX_WAIT_SECONDS:
-                            resume_at = datetime.fromtimestamp(
-                                time.time() + rate_limit_wait,
-                                tz=UTC,
-                            ).isoformat()
-                            print(
-                                f"ERROR rate limit for {handle} ({did}) resets at {resume_at}"
-                                + f" ({rate_limit_wait:.0f}s), exceeds max wait of"
-                                + f" {RATE_LIMIT_MAX_WAIT_SECONDS:.0f}s — aborting"
-                            )
-                            summary.failed += 1
-                            failures.append(f"{handle} ({did})")
-                            break
-
-                        resume_at = datetime.fromtimestamp(
-                            time.time() + rate_limit_wait,
-                            tz=UTC,
-                        ).isoformat()
-                        print(
-                            f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait:.0f}s)..."
-                        )
-                        time.sleep(rate_limit_wait)
-                        summary.retries += 1
-                        continue
-
-                attempt += 1
-                summary.retries += 1
-                backoff = min(
-                    MAX_BACKOFF_SECONDS,
-                    BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)),
-                )
-                wait_seconds = backoff + uniform(*JITTER_SECONDS)
-                print(
-                    f"WARN transient error for {handle} ({did}); retry {attempt}/{MAX_BLOCK_RETRIES} in {wait_seconds:.2f}s"
-                )
-                time.sleep(wait_seconds)
-
+        has_succeeded = _block_user_with_retries(
+            client=client,
+            user=user,
+            summary=summary,
+            failures=failures,
+            is_verbose=is_verbose,
+        )
         if has_succeeded:
             blocked_dids.add(did)
             summary.blocked += 1
