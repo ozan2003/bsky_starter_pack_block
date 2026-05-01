@@ -246,6 +246,14 @@ def parse_args() -> argparse.Namespace:
         help="Print users without blocking",
     )
 
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print verbose output",
+        default=False,
+    )
+
     return parser.parse_args()
 
 
@@ -879,11 +887,13 @@ class BlockResult:
 
 def block_users(
     client: Client,
+    *,
     users: list[Member],
     self_did: str,
     blocked_dids: set[str],
     delay: float,
     dry_run: bool,
+    is_verbose: bool,
 ) -> BlockResult:
     """Block each eligible starter pack member.
 
@@ -896,6 +906,7 @@ def block_users(
         delay: Seconds to sleep after each successful block.
         dry_run: When ``True``, print intended actions without creating block
             records.
+        is_verbose: When ``True``, print verbose output.
 
     Returns:
         A summary of the run and human-readable failure entries.
@@ -920,15 +931,16 @@ def block_users(
 
         if dry_run:
             summary.would_block += 1
-            print(f"DRY BLOCK {handle} ({did})")
+            if is_verbose:
+                print(f"DRY BLOCK {handle} ({did})")
             continue
 
-        success = False
+        has_succeeded = False
         attempt = 0
         while attempt <= MAX_BLOCK_RETRIES:
             try:
                 create_block_record(client, did)
-                success = True
+                has_succeeded = True
                 break
             except Exception as error:  # noqa: BLE001
                 if (
@@ -937,8 +949,11 @@ def block_users(
                 ):
                     error_text = describe_error(error)
                     summary.failed += 1
-                    failures.append(f"{handle} ({did}) -> {error_text}")
-                    print(f"ERROR {handle} ({did}) -> {error_text}")
+                    failures.append(f"{handle} ({did})")
+                    if is_verbose:
+                        print(f"ERROR {handle} ({did}) -> {error_text}")
+                    else:
+                        print(f"ERROR {handle} ({did})")
                     break
 
                 attempt += 1
@@ -953,7 +968,7 @@ def block_users(
                 )
                 time.sleep(wait_seconds)
 
-        if success:
+        if has_succeeded:
             blocked_dids.add(did)
             summary.blocked += 1
             print(f"BLOCK {handle} ({did})")
@@ -1026,12 +1041,13 @@ def main() -> None:
     blocked_dids = fetch_blocked_dids(client)
 
     result = block_users(
-        client=client,
+        client,
         users=users,
         self_did=self_did,
         blocked_dids=blocked_dids,
         delay=args.delay,
         dry_run=args.dry_run,
+        is_verbose=args.verbose,
     )
     print_summary(result, args.dry_run)
 
