@@ -44,6 +44,7 @@ import argparse
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isinf, isnan
@@ -83,10 +84,17 @@ MAX_BACKOFF_SECONDS = 8.0
 # Uniform random extra delay on each backoff (seconds), reduces synchronized retries.
 JITTER_SECONDS = (0.0, 0.6)
 
+# Error for non-existent packs or invalid DIDs.
+HTTP_STATUS_BAD_REQUEST = 400
 # HTTP response codes treated as retryable alongside network errors (see ``is_transient_error``).
 HTTP_STATUS_TOO_MANY_REQUESTS = 429
 # Any status greater than or equal to this is treated as a transient server error.
 HTTP_STATUS_SERVER_ERROR_MIN = 500
+
+# Rate-limit pause: small buffer added to the computed wait so the retry lands after the window resets.
+RATE_LIMIT_BUFFER_SECONDS = 2.0
+# If the server asks to wait longer than this, abort instead of blocking the terminal.
+RATE_LIMIT_MAX_WAIT_SECONDS = 900.0  # 15 minutes
 # User agent is initialized once at invocation.
 USER_AGENT = choice(
     (
@@ -562,7 +570,10 @@ def resolve_identifier_to_did(client: Client, identifier: str) -> str:
     if identifier.startswith("did:"):
         return identifier
 
-    response = client.resolve_handle(identifier)
+    response = call_with_rate_limit_retry(
+        lambda: client.resolve_handle(identifier),
+        context="resolve handle",
+    )
     if response.did:
         return response.did
 
@@ -649,7 +660,10 @@ def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
     """
 
     params = models.AppBskyGraphGetStarterPack.Params(starter_pack=at_uri)
-    response = client.app.bsky.graph.get_starter_pack(params)
+    response = call_with_rate_limit_retry(
+        lambda: client.app.bsky.graph.get_starter_pack(params),
+        context="fetch starter pack",
+    )
 
     starter_pack = response.starter_pack
     list_view = starter_pack.list
@@ -690,7 +704,10 @@ def fetch_members(client: Client, at_uri: str) -> list[Member]:
             limit=LIST_PAGE_SIZE,
             cursor=cursor,
         )
-        response = client.app.bsky.graph.get_list(params)
+        response = call_with_rate_limit_retry(
+            lambda params=params: client.app.bsky.graph.get_list(params),
+            context="fetch members page",
+        )
         for item in response.items:
             subject = item.subject
             did = subject.did
@@ -741,7 +758,10 @@ def fetch_blocked_dids(client: Client) -> set[str]:
             limit=BLOCKS_PAGE_SIZE,
             cursor=cursor,
         )
-        response = client.app.bsky.graph.get_blocks(params)
+        response = call_with_rate_limit_retry(
+            lambda params=params: client.app.bsky.graph.get_blocks(params),
+            context="fetch blocks page",
+        )
         for block in response.blocks:
             if block.did:
                 blocked_dids.add(block.did)
@@ -828,6 +848,70 @@ def extract_status_code(error: Exception) -> int | None:
     return None
 
 
+def extract_response_headers(error: Exception) -> dict[str, str]:
+    """Extract response headers from an SDK exception.
+
+    Args:
+        error: Exception raised by the AT Protocol client or network layer.
+
+    Returns:
+        The response headers dict, or an empty dict when unavailable.
+    """
+
+    response = getattr(error, "response", None)
+    if response is None:
+        return {}
+
+    headers = getattr(response, "headers", None)
+    if isinstance(headers, dict):
+        return cast(dict[str, str], headers)
+    return {}
+
+
+def extract_rate_limit_wait(error: Exception) -> float | None:
+    """Compute how long to sleep before the rate-limit window resets.
+
+    Reads the ``ratelimit-reset`` header (Unix epoch seconds) first, then
+    falls back to the standard ``retry-after`` header (delta seconds).  A
+    small buffer is added so the retry lands safely after the window edge.
+
+    Args:
+        error: Exception raised by the AT Protocol client or network layer.
+
+    Returns:
+        Seconds to wait (including buffer), or ``None`` when no usable
+        rate-limit timing is available in the response.
+    """
+
+    headers = extract_response_headers(error)
+    if not headers:
+        return None
+
+    reset_raw = headers.get("ratelimit-reset")
+    if reset_raw is not None:
+        try:
+            reset_ts = float(reset_raw)
+        except (TypeError, ValueError):
+            pass
+        else:
+            wait = reset_ts - time.time() + RATE_LIMIT_BUFFER_SECONDS
+            return max(wait, RATE_LIMIT_BUFFER_SECONDS)
+
+    retry_after_raw = headers.get("retry-after")
+    if retry_after_raw is not None:
+        try:
+            retry_seconds = float(retry_after_raw)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return max(
+                retry_seconds + RATE_LIMIT_BUFFER_SECONDS,
+                RATE_LIMIT_BUFFER_SECONDS,
+            )
+
+    return None
+
+
 def describe_error(error: Exception) -> str:
     """Build a human-readable error message.
 
@@ -870,6 +954,78 @@ def is_transient_error(error: Exception) -> bool:
 
     text = str(error).lower()
     return "rate limit" in text or "temporarily unavailable" in text
+
+
+def is_bad_request_skip(error: Exception) -> bool:
+    """Decide whether a 400 Bad Request should be silently skipped.
+
+    The AT Protocol API returns HTTP 400 for permanently invalid targets
+    (deleted accounts, malformed DIDs, etc.).  Retrying these is pointless,
+    and they should not count as actionable failures.
+
+    Args:
+        error: Exception raised during a block operation.
+
+    Returns:
+        ``True`` when the error is an HTTP 400 that indicates an invalid
+        or unreachable target.
+    """
+
+    return extract_status_code(error) == HTTP_STATUS_BAD_REQUEST
+
+
+def call_with_rate_limit_retry[T](fn: Callable[[], T], *, context: str) -> T:
+    """Call ``fn`` and transparently pause on HTTP 429 rate limits.
+
+    On a 429 response the function reads ``ratelimit-reset`` (or
+    ``retry-after``) from the response headers, sleeps until the window
+    resets, and retries.  Non-429 exceptions propagate immediately.
+
+    Args:
+        fn: Zero-argument callable that performs a single API request.
+        context: Human-readable label printed while pausing (e.g.
+            ``"fetch members page"``).
+
+    Returns:
+        The return value of ``fn`` on success.
+
+    Raises:
+        RuntimeError: If the rate-limit wait exceeds
+            ``RATE_LIMIT_MAX_WAIT_SECONDS``.
+    """
+
+    while True:
+        try:
+            return fn()
+        except Exception as error:
+            status_code = extract_status_code(error)
+            if status_code != HTTP_STATUS_TOO_MANY_REQUESTS:
+                raise
+
+            wait = extract_rate_limit_wait(error)
+            if wait is None:
+                raise
+
+            if wait > RATE_LIMIT_MAX_WAIT_SECONDS:
+                resume_at = datetime.fromtimestamp(
+                    time.time() + wait,
+                    tz=UTC,
+                ).isoformat()
+                msg = (
+                    f"Rate limit for {context} resets at {resume_at} "
+                    f"({wait:.0f}s), exceeds max wait of "
+                    f"{RATE_LIMIT_MAX_WAIT_SECONDS:.0f}s"
+                )
+                raise RuntimeError(msg) from error
+
+            resume_at = datetime.fromtimestamp(
+                time.time() + wait,
+                tz=UTC,
+            ).isoformat()
+            print(
+                f"RATE LIMITED ({context}): pausing until {resume_at} ({wait:.0f}s)..."
+            )
+            time.sleep(wait)
 
 
 @dataclass(slots=True)
@@ -956,6 +1112,37 @@ def block_users(
                         print(f"ERROR {handle} ({did})")
                     break
 
+                status_code = extract_status_code(error)
+                is_rate_limited = status_code == HTTP_STATUS_TOO_MANY_REQUESTS
+
+                if is_rate_limited:
+                    rate_limit_wait = extract_rate_limit_wait(error)
+                    if rate_limit_wait is not None:
+                        if rate_limit_wait > RATE_LIMIT_MAX_WAIT_SECONDS:
+                            resume_at = datetime.fromtimestamp(
+                                time.time() + rate_limit_wait,
+                                tz=UTC,
+                            ).isoformat()
+                            print(
+                                f"ERROR rate limit for {handle} ({did}) resets at {resume_at}"
+                                + f" ({rate_limit_wait:.0f}s), exceeds max wait of"
+                                + f" {RATE_LIMIT_MAX_WAIT_SECONDS:.0f}s — aborting"
+                            )
+                            summary.failed += 1
+                            failures.append(f"{handle} ({did})")
+                            break
+
+                        resume_at = datetime.fromtimestamp(
+                            time.time() + rate_limit_wait,
+                            tz=UTC,
+                        ).isoformat()
+                        print(
+                            f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait:.0f}s)..."
+                        )
+                        time.sleep(rate_limit_wait)
+                        summary.retries += 1
+                        continue
+
                 attempt += 1
                 summary.retries += 1
                 backoff = min(
@@ -1027,16 +1214,28 @@ def main() -> None:
         pack_inputs = load_pack_inputs_from_file(args.pack_file)
 
     merged: dict[str, Member] = {}
+    skipped_packs: list[str] = []
     for pack_input in pack_inputs:
-        at_uri = normalize_starter_pack_uri(client, pack_input)
-        print(f"Using starter pack {at_uri}")
-        pack_members = fetch_members(client, at_uri)
+        try:
+            at_uri = normalize_starter_pack_uri(client, pack_input)
+            print(f"Using starter pack {at_uri}")
+            pack_members = fetch_members(client, at_uri)
+        except Exception as error:
+            if not is_bad_request_skip(error):
+                raise
+            skipped_packs.append(pack_input)
+            print(f"SKIP starter pack {pack_input}: {describe_error(error)}")
+            continue
         print(f"\t- Loaded {len(pack_members)} members from this pack")
         merge_unique_members(merged, pack_members)
     users = list(merged.values())
     print(
         f"Loaded {len(users)} unique members across {len(pack_inputs)} starter pack(s)"
     )
+    if skipped_packs:
+        print(
+            f"Skipped {len(skipped_packs)} starter pack(s) due to bad request errors"
+        )
 
     blocked_dids = fetch_blocked_dids(client)
 
