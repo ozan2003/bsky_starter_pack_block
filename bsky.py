@@ -258,13 +258,15 @@ def parse_args() -> argparse.Namespace:
     pack_input_group = parser.add_mutually_exclusive_group(required=True)
 
     pack_input_group.add_argument(
-        "--pack",
+        "-i",
+        "--input",
         type=str,
         help="Single starter-pack/list URL or AT URI",
     )
 
     pack_input_group.add_argument(
-        "--pack-file",
+        "-f",
+        "--file",
         type=str,
         help="Path to a UTF-8 text file with one starter-pack/list URL or AT URI per line",
     )
@@ -293,7 +295,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_pack_inputs_from_file(path: str) -> list[str]:
+def load_inputs_from_file(path: str) -> list[str]:
     """Load starter-pack/list inputs from a UTF-8 text file.
 
     Note that it won't do any normalization or validation of the inputs.
@@ -309,20 +311,20 @@ def load_pack_inputs_from_file(path: str) -> list[str]:
         ValueError: If the file cannot be read or contains no usable pack lines.
     """
 
-    pack_file_path = Path(path)
+    file_path = Path(path)
     try:
-        with pack_file_path.open(encoding="utf-8") as pack_file:
-            pack_inputs = [
-                stripped for line in pack_file if (stripped := line.strip())
-            ]
+        with file_path.open(encoding="utf-8") as fp:
+            inputs = [stripped for line in fp if (stripped := line.strip())]
     except OSError as error:
-        msg = f"Could not read pack file {pack_file_path}: {error}"
+        msg = f"Could not read pack file {file_path}: {error}"
         raise ValueError(msg) from error
 
-    if pack_inputs:
-        return pack_inputs
+    if inputs:
+        return inputs
 
-    msg = f"Pack file {pack_file_path} does not contain any starter-pack/list inputs"
+    msg = (
+        f"Pack file {file_path} does not contain any starter-pack/list inputs"
+    )
     raise ValueError(msg)
 
 
@@ -701,7 +703,9 @@ def normalize_starter_pack_uri(client: Client, pack_input: str) -> str:
     """
 
     reference = normalize_input_uri(client, pack_input)
-    return f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
+    return (
+        f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
+    )
 
 
 def login(handle: str, app_password: str) -> tuple[Client, str]:
@@ -770,7 +774,7 @@ def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
 
 
 def resolve_input_to_list_target(
-    client: Client, pack_input: str
+    client: Client, source_input: str
 ) -> ResolvedListTarget:
     """Resolve any supported input into a list URI target.
 
@@ -787,8 +791,10 @@ def resolve_input_to_list_target(
         ValueError: If the input format is unsupported.
     """
 
-    reference = normalize_input_uri(client, pack_input)
-    at_uri = f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
+    reference = normalize_input_uri(client, source_input)
+    at_uri = (
+        f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
+    )
 
     if reference.collection == STARTER_PACK_COLLECTION:
         list_uri = fetch_starter_pack_list_uri(client, at_uri)
@@ -1434,30 +1440,30 @@ def main() -> None:
     app_password = resolve_app_password(args.app_password)
     client, self_did = login(args.handle, app_password)
 
-    pack_inputs: list[str]
+    source_inputs: list[str]
     if args.pack is not None:
-        pack_inputs = [args.pack]
+        source_inputs = [args.pack]
     else:
-        pack_inputs = load_pack_inputs_from_file(args.pack_file)
+        source_inputs = load_inputs_from_file(args.pack_file)
 
     merged: dict[str, Member] = {}
     skipped_inputs: list[str] = []
-    for pack_input in pack_inputs:
+    for s_input in source_inputs:
         try:
-            target = resolve_input_to_list_target(client, pack_input)
+            target = resolve_input_to_list_target(client, s_input)
             print(f"Using {target.source_kind} {target.list_uri}")
             pack_members = fetch_list_members(client, target.list_uri)
         except Exception as error:
             if not is_bad_request_skip(error):
                 raise
-            skipped_inputs.append(pack_input)
-            print(f"SKIP input {pack_input}: {describe_error(error)}")
+            skipped_inputs.append(s_input)
+            print(f"SKIP input {s_input}: {describe_error(error)}")
             continue
         print(f"\t- Loaded {len(pack_members)} members from this input")
         merge_unique_members(merged, pack_members)
     users = list(merged.values())
     print(
-        f"Loaded {len(users)} unique members across {len(pack_inputs)} input source(s)"
+        f"Loaded {len(users)} unique members across {len(source_inputs)} input source(s)"
     )
     if skipped_inputs:
         print(
