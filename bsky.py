@@ -1444,7 +1444,7 @@ def main() -> None:
     if args.input is not None:
         source_inputs = [args.input]
     else:
-        source_inputs = load_inputs_from_file(args.input_file)
+        source_inputs = load_inputs_from_file(args.file)
 
     merged: dict[str, Member] = {}
     skipped_inputs: list[str] = []
