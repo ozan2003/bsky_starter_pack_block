@@ -1441,10 +1441,10 @@ def main() -> None:
     client, self_did = login(args.handle, app_password)
 
     source_inputs: list[str]
-    if args.pack is not None:
-        source_inputs = [args.pack]
+    if args.input is not None:
+        source_inputs = [args.input]
     else:
-        source_inputs = load_inputs_from_file(args.pack_file)
+        source_inputs = load_inputs_from_file(args.input_file)
 
     merged: dict[str, Member] = {}
     skipped_inputs: list[str] = []
