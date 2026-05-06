@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Block every account listed in one or more Bluesky starter packs.
+"""Block every account listed in one or more Bluesky starter packs or lists.
 
-This script logs in to Bluesky with an app password, resolves each starter
-pack input to a backing list, loads every account across those lists (merging
+This script logs in to Bluesky with an app password, resolves each supported
+input to a list URI, loads every account across those lists (merging
 unique members by account), skips your own account and accounts you already
 block, then creates block records for the remaining accounts.
 
-Supported starter pack inputs:
+Supported inputs:
     - ``at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>``
+    - ``at://<did-or-handle>/app.bsky.graph.list/<rkey>``
     - ``https://bsky.app/start/<did-or-handle>/<rkey>``
     - ``https://bsky.app/starter-pack/<did-or-handle>/<rkey>``
+    - ``https://bsky.app/profile/<did-or-handle>/lists/<rkey>``
     - ``https://bsky.app/starter-pack-short/<code>``
     - ``https://go.bsky.app/<code>``
 
@@ -47,6 +49,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import IntEnum, auto
 from math import isinf, isnan
 from pathlib import Path
 from random import choice, uniform
@@ -58,7 +61,10 @@ from urllib.request import Request, urlopen
 from atproto import Client, models
 
 STARTER_PACK_COLLECTION = "app.bsky.graph.starterpack"
+LIST_COLLECTION = "app.bsky.graph.list"
 SUPPORTED_STARTER_PACK_PATHS = {"start", "starter-pack"}
+PROFILE_PATH_SEGMENT = "profile"
+LISTS_PATH_SEGMENT = "lists"
 BSKY_APP_HOSTS = {"bsky.app", "www.bsky.app"}
 BSKY_SHORT_LINK_HOST = "go.bsky.app"
 STARTER_PACK_SHORT_PATH = "starter-pack-short"
@@ -152,15 +158,17 @@ class BlockSummary:
 
 @dataclass(frozen=True, slots=True)
 class PackReference:
-    """Canonical starter pack reference before DID normalization.
+    """Canonical starter pack/list reference before DID normalization.
 
     Attributes:
-        identifier: Starter pack creator DID or handle.
-        rkey: Starter pack record key.
+        identifier: Starter-pack/list creator DID or handle.
+        rkey: Record key.
+        collection: AT Protocol collection for the reference.
     """
 
     identifier: str
     rkey: str
+    collection: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +183,26 @@ class ShortStarterPackLink:
 
 
 type PackInput = PackReference | ShortStarterPackLink
+
+
+class SourceKind(IntEnum):
+    """Kind of source input."""
+
+    STARTER_PACK = auto()
+    LIST = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedListTarget:
+    """Resolved list target used by the fetch/block pipeline.
+
+    Attributes:
+        list_uri: Canonical list AT URI ready for ``app.bsky.graph.getList``.
+        source_kind: Whether the input was a direct list or a starter pack.
+    """
+
+    list_uri: str
+    source_kind: SourceKind
 
 
 def parse_delay(value: str) -> float:
@@ -205,12 +233,12 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line options.
 
     Returns:
-        Parsed command-line arguments for login, one or more starter pack
+        Parsed command-line arguments for login, one or more starter-pack/list
         inputs, throttling, and dry-run mode.
     """
 
     parser = argparse.ArgumentParser(
-        description="Block all users from one or more Bluesky starter packs",
+        description="Block all users from one or more Bluesky starter packs or lists",
     )
 
     parser.add_argument(
@@ -232,13 +260,13 @@ def parse_args() -> argparse.Namespace:
     pack_input_group.add_argument(
         "--pack",
         type=str,
-        help="Single starter pack URL or AT URI",
+        help="Single starter-pack/list URL or AT URI",
     )
 
     pack_input_group.add_argument(
         "--pack-file",
         type=str,
-        help="Path to a UTF-8 text file with one starter pack URL or AT URI per line",
+        help="Path to a UTF-8 text file with one starter-pack/list URL or AT URI per line",
     )
 
     parser.add_argument(
@@ -266,16 +294,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_pack_inputs_from_file(path: str) -> list[str]:
-    """Load starter pack inputs from a UTF-8 text file.
+    """Load starter-pack/list inputs from a UTF-8 text file.
 
     Note that it won't do any normalization or validation of the inputs.
-    Refer to ``normalize_starter_pack_uri`` for more information.
+    Refer to ``normalize_input_uri`` for more information.
 
     Args:
-        path: File path containing one starter pack input per line.
+        path: File path containing one starter-pack/list input per line.
 
     Returns:
-        Non-empty starter pack input lines with surrounding whitespace removed.
+        Non-empty input lines with surrounding whitespace removed.
 
     Raises:
         ValueError: If the file cannot be read or contains no usable pack lines.
@@ -294,9 +322,7 @@ def load_pack_inputs_from_file(path: str) -> list[str]:
     if pack_inputs:
         return pack_inputs
 
-    msg = (
-        f"Pack file {pack_file_path} does not contain any starter pack inputs"
-    )
+    msg = f"Pack file {pack_file_path} does not contain any starter-pack/list inputs"
     raise ValueError(msg)
 
 
@@ -325,31 +351,34 @@ def resolve_app_password(cli_password: str | None) -> str:
     raise ValueError(msg)
 
 
-def starter_pack_format_error() -> str:
-    """Build the supported starter pack input error message.
+def supported_input_format_error() -> str:
+    """Build the supported input error message.
 
     Returns:
-        A message listing every supported starter pack input format.
+        A message listing every supported starter-pack/list input format.
     """
 
     return (
-        "Starter pack input must be one of: "
+        "Input must be one of: "
         "at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>, "
+        "at://<did-or-handle>/app.bsky.graph.list/<rkey>, "
         "https://bsky.app/start/<did-or-handle>/<rkey>, "
         "https://bsky.app/starter-pack/<did-or-handle>/<rkey>, "
+        "https://bsky.app/profile/<did-or-handle>/lists/<rkey>, "
         "https://bsky.app/starter-pack-short/<code>, "
         "or https://go.bsky.app/<code>"
     )
 
 
 def parse_at_uri(raw: str) -> PackReference | None:
-    """Parse a starter pack AT URI.
+    """Parse a supported list/starter-pack AT URI.
 
     Args:
         raw: User-provided input after whitespace trimming.
 
     Returns:
-        A starter pack reference when ``raw`` is an AT URI, otherwise ``None``.
+        A canonical pack/list reference when ``raw`` is an AT URI, otherwise
+        ``None``.
 
     Raises:
         ValueError: If ``raw`` is an AT URI but has the wrong shape or
@@ -363,16 +392,23 @@ def parse_at_uri(raw: str) -> PackReference | None:
     if len(parts) != 3:
         msg = (
             "AT URI must be in the format "
-            "at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>"
+            "at://<did-or-handle>/<collection>/<rkey>"
         )
         raise ValueError(msg)
 
     identifier, collection, rkey = parts
-    if collection != STARTER_PACK_COLLECTION:
-        msg = f"Starter pack AT URI must use collection {STARTER_PACK_COLLECTION}"
+    if collection not in {STARTER_PACK_COLLECTION, LIST_COLLECTION}:
+        msg = (
+            "AT URI must use collection "
+            + f"{STARTER_PACK_COLLECTION} or {LIST_COLLECTION}"
+        )
         raise ValueError(msg)
 
-    return PackReference(identifier=identifier, rkey=rkey)
+    return PackReference(
+        identifier=identifier,
+        rkey=rkey,
+        collection=collection,
+    )
 
 
 def parse_starter_pack_path(path_source: str) -> PackReference | None:
@@ -391,7 +427,38 @@ def parse_starter_pack_path(path_source: str) -> PackReference | None:
         return None
 
     _, identifier, rkey = parts
-    return PackReference(identifier=identifier, rkey=rkey)
+    return PackReference(
+        identifier=identifier,
+        rkey=rkey,
+        collection=STARTER_PACK_COLLECTION,
+    )
+
+
+def parse_list_path(path_source: str) -> PackReference | None:
+    """Parse a canonical Bluesky direct-list URL path.
+
+    Args:
+        path_source: URL path or path-like input.
+
+    Returns:
+        A list reference for ``/profile/.../lists/...`` paths, otherwise
+        ``None``.
+    """
+
+    parts = [part for part in path_source.split("/") if part]
+    if (
+        len(parts) != 4
+        or parts[0] != PROFILE_PATH_SEGMENT
+        or parts[2] != LISTS_PATH_SEGMENT
+    ):
+        return None
+
+    _, identifier, _, rkey = parts
+    return PackReference(
+        identifier=identifier,
+        rkey=rkey,
+        collection=LIST_COLLECTION,
+    )
 
 
 def parse_short_pack_path(
@@ -430,10 +497,11 @@ def parse_short_pack_path(
 
 
 def parse_pack_input(pack_input: str) -> PackInput:
-    """Parse any supported starter pack input format.
+    """Parse any supported starter-pack/list input format.
 
     Args:
-        pack_input: Starter pack AT URI, canonical Bluesky URL, or short link.
+        pack_input: Starter-pack/list AT URI, canonical Bluesky URL, or short
+            link.
 
     Returns:
         A canonical pack reference, or a short-link reference that still needs
@@ -441,12 +509,12 @@ def parse_pack_input(pack_input: str) -> PackInput:
 
     Raises:
         ValueError: If the input is empty, uses an unsupported scheme or host,
-            or does not match a supported starter pack format.
+            or does not match a supported format.
     """
 
     raw = pack_input.strip()
     if not raw:
-        msg = "Starter pack input cannot be empty"
+        msg = "Input cannot be empty"
         raise ValueError(msg)
 
     # AT URIs are already the format required by the Bluesky API, except that
@@ -460,13 +528,13 @@ def parse_pack_input(pack_input: str) -> PackInput:
     path_source = parsed.path if parsed.scheme else raw
 
     if parsed.scheme and parsed.scheme not in {"http", "https"}:
-        raise ValueError(starter_pack_format_error())
+        raise ValueError(supported_input_format_error())
 
     if host is not None and host not in {
         *BSKY_APP_HOSTS,
         BSKY_SHORT_LINK_HOST,
     }:
-        msg = f"Unsupported starter pack URL host: {host}"
+        msg = f"Unsupported Bluesky URL host: {host}"
         raise ValueError(msg)
 
     if not parsed.scheme:
@@ -486,20 +554,24 @@ def parse_pack_input(pack_input: str) -> PackInput:
     if reference is not None:
         return reference
 
+    list_reference = parse_list_path(path_source)
+    if list_reference is not None:
+        return list_reference
+
     # Short links do not contain the DID/rkey pair. Return a marker object so
     # normalization can resolve the link before trying to build an AT URI.
     short_link = parse_short_pack_path(host, path_source)
     if short_link is not None:
         return short_link
 
-    raise ValueError(starter_pack_format_error())
+    raise ValueError(supported_input_format_error())
 
 
 def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
-    """Resolve a Bluesky short link to its canonical starter pack URL.
+    """Resolve a Bluesky short link to its canonical URL.
 
     Args:
-        short_link: Validated Bluesky starter pack short link.
+        short_link: Validated Bluesky short link.
 
     Returns:
         The canonical URL returned by the short-link service.
@@ -512,7 +584,7 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
 
     parsed = urlparse(short_link.url)
     if parsed.scheme != "https" or parsed.hostname != BSKY_SHORT_LINK_HOST:
-        msg = f"Unsupported starter pack short link URL: {short_link.url}"
+        msg = f"Unsupported short link URL: {short_link.url}"
         raise ValueError(msg)
 
     # Bluesky's short-link service returns JSON when requested with this Accept
@@ -543,13 +615,15 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
             if isinstance(final_url, str) and final_url != short_link.url:
                 return final_url
     except HTTPError as error:
-        msg = f"Could not resolve starter pack short link {short_link.url}: HTTP {error.code}"
+        msg = (
+            f"Could not resolve short link {short_link.url}: HTTP {error.code}"
+        )
         raise RuntimeError(msg) from error
     except (OSError, TimeoutError, URLError, json.JSONDecodeError) as error:
-        msg = f"Could not resolve starter pack short link {short_link.url}: {error}"
+        msg = f"Could not resolve short link {short_link.url}: {error}"
         raise RuntimeError(msg) from error
 
-    msg = f"Short link did not resolve to a starter pack URL: {short_link.url}"
+    msg = f"Short link did not resolve to a supported URL: {short_link.url}"
     raise RuntimeError(msg)
 
 
@@ -581,37 +655,45 @@ def resolve_identifier_to_did(client: Client, identifier: str) -> str:
     raise RuntimeError(msg)
 
 
-def normalize_starter_pack_uri(client: Client, pack_input: str) -> str:
-    """Normalize a starter pack input into the AT URI expected by the API.
+def normalize_input_uri(client: Client, pack_input: str) -> str:
+    """Normalize a supported input into a canonical AT URI.
 
     Args:
         client: Authenticated AT Protocol client used for handle-to-DID
             resolution.
-        pack_input: Starter pack AT URI, canonical Bluesky URL, or short link.
+        pack_input: Starter-pack/list AT URI, canonical Bluesky URL, or short
+            link.
 
     Returns:
-        A canonical starter pack AT URI using the creator DID.
+        A canonical starter-pack/list AT URI using the creator DID.
 
     Raises:
         RuntimeError: If short-link resolution loops too many times.
-        ValueError: If the starter pack input format is unsupported.
+        ValueError: If the input format is unsupported.
     """
 
     current_input = pack_input
     for _ in range(3):
         parsed_input = parse_pack_input(current_input)
-        if isinstance(parsed_input, PackReference):
-            # The graph API requires the creator DID in the AT URI; web links
-            # may contain a handle, so resolve that as the final parse step.
-            did = resolve_identifier_to_did(client, parsed_input.identifier)
-            return f"at://{did}/{STARTER_PACK_COLLECTION}/{parsed_input.rkey}"
+        if isinstance(parsed_input, ShortStarterPackLink):
+            # A short link resolves to another supported input format, usually
+            # https://bsky.app/start/<did>/<rkey>, so loop back through the parser.
+            current_input = resolve_short_starter_pack_url(parsed_input)
+            continue
 
-        # A short link resolves to another supported input format, usually
-        # https://bsky.app/start/<did>/<rkey>, so loop back through the parser.
-        current_input = resolve_short_starter_pack_url(parsed_input)
+        # The graph API requires the creator DID in the AT URI; web links
+        # may contain a handle, so resolve that as the final parse step.
+        did = resolve_identifier_to_did(client, parsed_input.identifier)
+        return f"at://{did}/{parsed_input.collection}/{parsed_input.rkey}"
 
-    msg = f"Starter pack short link resolution loop exceeded for {pack_input}"
+    msg = f"Short link resolution loop exceeded for {pack_input}"
     raise RuntimeError(msg)
+
+
+def normalize_starter_pack_uri(client: Client, pack_input: str) -> str:
+    """Backward-compatible alias for ``normalize_input_uri``."""
+
+    return normalize_input_uri(client, pack_input)
 
 
 def login(handle: str, app_password: str) -> tuple[Client, str]:
@@ -679,22 +761,50 @@ def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
     return list_uri
 
 
-def fetch_members(client: Client, at_uri: str) -> list[Member]:
-    """Load all unique account members from a starter pack.
+def resolve_input_to_list_target(
+    client: Client, pack_input: str
+) -> ResolvedListTarget:
+    """Resolve any supported input into a list URI target.
 
     Args:
         client: Authenticated AT Protocol client.
-        at_uri: Starter pack AT URI.
+        pack_input: Raw user input identifying a starter pack or list.
 
     Returns:
-        Unique starter pack members keyed by DID.
+        A list target with source metadata for logging.
 
     Raises:
-        RuntimeError: If the backing list URI cannot be resolved
-            (see ``fetch_starter_pack_list_uri``).
+        RuntimeError: If starter-pack list resolution fails or normalization
+            does not produce a valid AT URI.
+        ValueError: If the input format is unsupported.
     """
 
-    list_uri = fetch_starter_pack_list_uri(client, at_uri)
+    at_uri = normalize_input_uri(client, pack_input)
+    reference = parse_at_uri(at_uri)
+    if reference is None:
+        msg = f"Normalization did not return a valid AT URI: {at_uri}"
+        raise RuntimeError(msg)
+
+    if reference.collection == STARTER_PACK_COLLECTION:
+        list_uri = fetch_starter_pack_list_uri(client, at_uri)
+        return ResolvedListTarget(
+            list_uri=list_uri, source_kind=SourceKind.STARTER_PACK
+        )
+
+    return ResolvedListTarget(list_uri=at_uri, source_kind=SourceKind.LIST)
+
+
+def fetch_list_members(client: Client, list_uri: str) -> list[Member]:
+    """Load all unique account members from a list.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        list_uri: List AT URI.
+
+    Returns:
+        Unique list members keyed by DID.
+    """
+
     members_by_did: dict[str, Member] = {}
     cursor: str | None = None
 
@@ -1326,27 +1436,27 @@ def main() -> None:
         pack_inputs = load_pack_inputs_from_file(args.pack_file)
 
     merged: dict[str, Member] = {}
-    skipped_packs: list[str] = []
+    skipped_inputs: list[str] = []
     for pack_input in pack_inputs:
         try:
-            at_uri = normalize_starter_pack_uri(client, pack_input)
-            print(f"Using starter pack {at_uri}")
-            pack_members = fetch_members(client, at_uri)
+            target = resolve_input_to_list_target(client, pack_input)
+            print(f"Using {target.source_kind} {target.list_uri}")
+            pack_members = fetch_list_members(client, target.list_uri)
         except Exception as error:
             if not is_bad_request_skip(error):
                 raise
-            skipped_packs.append(pack_input)
-            print(f"SKIP starter pack {pack_input}: {describe_error(error)}")
+            skipped_inputs.append(pack_input)
+            print(f"SKIP input {pack_input}: {describe_error(error)}")
             continue
-        print(f"\t- Loaded {len(pack_members)} members from this pack")
+        print(f"\t- Loaded {len(pack_members)} members from this input")
         merge_unique_members(merged, pack_members)
     users = list(merged.values())
     print(
-        f"Loaded {len(users)} unique members across {len(pack_inputs)} starter pack(s)"
+        f"Loaded {len(users)} unique members across {len(pack_inputs)} input source(s)"
     )
-    if skipped_packs:
+    if skipped_inputs:
         print(
-            f"Skipped {len(skipped_packs)} starter pack(s) due to bad request errors"
+            f"Skipped {len(skipped_inputs)} input source(s) due to bad request errors"
         )
 
     blocked_dids = fetch_blocked_dids(client)
