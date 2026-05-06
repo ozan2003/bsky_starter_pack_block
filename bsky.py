@@ -49,7 +49,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import IntEnum, auto
+from enum import StrEnum
 from math import isinf, isnan
 from pathlib import Path
 from random import choice, uniform
@@ -185,11 +185,11 @@ class ShortStarterPackLink:
 type PackInput = PackReference | ShortStarterPackLink
 
 
-class SourceKind(IntEnum):
+class SourceKind(StrEnum):
     """Kind of source input."""
 
-    STARTER_PACK = auto()
-    LIST = auto()
+    STARTER_PACK = "starter_pack"
+    LIST = "list"
 
 
 @dataclass(frozen=True, slots=True)
