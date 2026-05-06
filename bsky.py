@@ -655,8 +655,8 @@ def resolve_identifier_to_did(client: Client, identifier: str) -> str:
     raise RuntimeError(msg)
 
 
-def normalize_input_uri(client: Client, pack_input: str) -> str:
-    """Normalize a supported input into a canonical AT URI.
+def normalize_input_uri(client: Client, pack_input: str) -> PackReference:
+    """Normalize a supported input into a canonical ``PackReference``.
 
     Args:
         client: Authenticated AT Protocol client used for handle-to-DID
@@ -665,7 +665,7 @@ def normalize_input_uri(client: Client, pack_input: str) -> str:
             link.
 
     Returns:
-        A canonical starter-pack/list AT URI using the creator DID.
+        A ``PackReference`` with the resolved DID, collection, and rkey.
 
     Raises:
         RuntimeError: If short-link resolution loops too many times.
@@ -684,16 +684,24 @@ def normalize_input_uri(client: Client, pack_input: str) -> str:
         # The graph API requires the creator DID in the AT URI; web links
         # may contain a handle, so resolve that as the final parse step.
         did = resolve_identifier_to_did(client, parsed_input.identifier)
-        return f"at://{did}/{parsed_input.collection}/{parsed_input.rkey}"
+        return PackReference(
+            identifier=did,
+            rkey=parsed_input.rkey,
+            collection=parsed_input.collection,
+        )
 
     msg = f"Short link resolution loop exceeded for {pack_input}"
     raise RuntimeError(msg)
 
 
 def normalize_starter_pack_uri(client: Client, pack_input: str) -> str:
-    """Backward-compatible alias for ``normalize_input_uri``."""
+    """Backward-compatible alias for ``normalize_input_uri``.
 
-    return normalize_input_uri(client, pack_input)
+    Returns a canonical AT URI string rather than a ``PackReference``.
+    """
+
+    reference = normalize_input_uri(client, pack_input)
+    return f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
 
 
 def login(handle: str, app_password: str) -> tuple[Client, str]:
@@ -779,11 +787,8 @@ def resolve_input_to_list_target(
         ValueError: If the input format is unsupported.
     """
 
-    at_uri = normalize_input_uri(client, pack_input)
-    reference = parse_at_uri(at_uri)
-    if reference is None:
-        msg = f"Normalization did not return a valid AT URI: {at_uri}"
-        raise RuntimeError(msg)
+    reference = normalize_input_uri(client, pack_input)
+    at_uri = f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
 
     if reference.collection == STARTER_PACK_COLLECTION:
         list_uri = fetch_starter_pack_list_uri(client, at_uri)
