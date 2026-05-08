@@ -24,17 +24,17 @@ Usage:
 
     Run a dry run before blocking:
 
-    ``python3 bsky.py --handle user.bsky.social --pack <url-or-at-uri> --dry-run``
+    ``python3 bsky.py --handle user.bsky.social --input <url-or-at-uri> --dry-run``
 
     Or load pack inputs from a file (one input per line):
 
-    ``python3 bsky.py --handle user.bsky.social --pack-file packs.txt --dry-run``
+    ``python3 bsky.py --handle user.bsky.social --file inputs.txt --dry-run``
 
-    ``--pack`` and ``--pack-file`` are mutually exclusive.
+    ``--input`` and ``--file`` are mutually exclusive.
 
     If the dry run looks correct, run without ``--dry-run``:
 
-    ``python3 bsky.py --handle user.bsky.social --pack <url-or-at-uri>``
+    ``python3 bsky.py --handle user.bsky.social --input <url-or-at-uri>``
 
     You can pass ``--delay`` to control the pause between block operations.
     ``--app-password`` is supported, but the environment variable is safer.
