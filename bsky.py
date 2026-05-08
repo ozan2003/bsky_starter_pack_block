@@ -9,11 +9,11 @@ block, then creates block records for the remaining accounts.
 Supported inputs:
     - ``at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>``
     - ``at://<did-or-handle>/app.bsky.graph.list/<rkey>``
-    - ``https://bsky.app/start/<did-or-handle>/<rkey>``
-    - ``https://bsky.app/starter-pack/<did-or-handle>/<rkey>``
-    - ``https://bsky.app/profile/<did-or-handle>/lists/<rkey>``
-    - ``https://bsky.app/starter-pack-short/<code>``
-    - ``https://go.bsky.app/<code>``
+    - ``http(s)://bsky.app/start/<did-or-handle>/<rkey>``
+    - ``http(s)://bsky.app/starter-pack/<did-or-handle>/<rkey>``
+    - ``http(s)://bsky.app/profile/<did-or-handle>/lists/<rkey>``
+    - ``http(s)://bsky.app/starter-pack-short/<code>``
+    - ``http(s)://go.bsky.app/<code>``
 
 Usage:
     First create an app password in Bluesky under Settings -> Privacy and
@@ -316,14 +316,14 @@ def load_inputs_from_file(path: str) -> list[str]:
         with file_path.open(encoding="utf-8") as fp:
             inputs = [stripped for line in fp if (stripped := line.strip())]
     except OSError as error:
-        msg = f"Could not read input file {file_path}: {error}"
+        msg = f"Could not read source file {file_path}: {error}"
         raise ValueError(msg) from error
 
     if inputs:
         return inputs
 
     msg = (
-        f"Pack file {file_path} does not contain any starter-pack/list inputs"
+        f"Source file {file_path} does not contain any starter-pack/list inputs"
     )
     raise ValueError(msg)
 
@@ -364,11 +364,11 @@ def supported_input_format_error() -> str:
         "Input must be one of: "
         "at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>, "
         "at://<did-or-handle>/app.bsky.graph.list/<rkey>, "
-        "https://bsky.app/start/<did-or-handle>/<rkey>, "
-        "https://bsky.app/starter-pack/<did-or-handle>/<rkey>, "
-        "https://bsky.app/profile/<did-or-handle>/lists/<rkey>, "
-        "https://bsky.app/starter-pack-short/<code>, "
-        "or https://go.bsky.app/<code>"
+        "http(s)://bsky.app/start/<did-or-handle>/<rkey>, "
+        "http(s)://bsky.app/starter-pack/<did-or-handle>/<rkey>, "
+        "http(s)://bsky.app/profile/<did-or-handle>/lists/<rkey>, "
+        "http(s)://bsky.app/starter-pack-short/<code>, "
+        "or http(s)://go.bsky.app/<code>"
     )
 
 
@@ -657,13 +657,13 @@ def resolve_identifier_to_did(client: Client, identifier: str) -> str:
     raise RuntimeError(msg)
 
 
-def normalize_input_uri(client: Client, pack_input: str) -> PackReference:
+def normalize_input_uri(client: Client, source_input: str) -> PackReference:
     """Normalize a supported input into a canonical ``PackReference``.
 
     Args:
         client: Authenticated AT Protocol client used for handle-to-DID
             resolution.
-        pack_input: Starter-pack/list AT URI, canonical Bluesky URL, or short
+        source_input: Starter-pack/list AT URI, canonical Bluesky URL, or short
             link.
 
     Returns:
@@ -674,7 +674,7 @@ def normalize_input_uri(client: Client, pack_input: str) -> PackReference:
         ValueError: If the input format is unsupported.
     """
 
-    current_input = pack_input
+    current_input = source_input
     for _ in range(3):
         parsed_input = parse_pack_input(current_input)
         if isinstance(parsed_input, ShortStarterPackLink):
@@ -692,7 +692,7 @@ def normalize_input_uri(client: Client, pack_input: str) -> PackReference:
             collection=parsed_input.collection,
         )
 
-    msg = f"Short link resolution loop exceeded for {pack_input}"
+    msg = f"Short link resolution loop exceeded for {source_input}"
     raise RuntimeError(msg)
 
 
