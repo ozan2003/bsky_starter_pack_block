@@ -316,7 +316,7 @@ def load_inputs_from_file(path: str) -> list[str]:
         with file_path.open(encoding="utf-8") as fp:
             inputs = [stripped for line in fp if (stripped := line.strip())]
     except OSError as error:
-        msg = f"Could not read pack file {file_path}: {error}"
+        msg = f"Could not read input file {file_path}: {error}"
         raise ValueError(msg) from error
 
     if inputs:
