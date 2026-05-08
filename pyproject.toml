@@ -1,7 +1,7 @@
 [project]
 name = "bsky-starter-pack-block"
 version = "0.1.0"
-description = "Block all users from a Bluesky starter pack"
+description = "Block all users from a Bluesky starter pack or list"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
