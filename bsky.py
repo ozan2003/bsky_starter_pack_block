@@ -43,12 +43,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import StrEnum
 from math import isinf, isnan
 from pathlib import Path
@@ -70,7 +70,7 @@ BSKY_SHORT_LINK_HOST = "go.bsky.app"
 STARTER_PACK_SHORT_PATH = "starter-pack-short"
 
 # Socket timeout for urllib when resolving short links (go.bsky.app redirects).
-SHORT_LINK_TIMEOUT_SECONDS = 10.0
+SHORT_LINK_TIMEOUT = dt.timedelta(seconds=10.0)
 
 # Maximum records per page for listRepos/listRecords-style reads.
 LIST_PAGE_SIZE = 100
@@ -79,16 +79,17 @@ LIST_PAGE_SIZE = 100
 BLOCKS_PAGE_SIZE = 100
 
 # Successful blocks are followed by ``time.sleep(delay)``, CLI default when ``--delay`` omitted.
-DEFAULT_DELAY_SECONDS = 0.5
+DEFAULT_DELAY = dt.timedelta(seconds=0.5)
 
 # Retries after transient failures in ``block_users`` use capped exponential backoff + jitter.
 MAX_BLOCK_RETRIES = 4  # Highest ``attempt`` index allowed before giving up (matches ``while attempt <= ...``).
-BASE_BACKOFF_SECONDS = 1.0  # Wait ``min(MAX, BASE * 2**(attempt - 1))`` seconds before each retry.
+# Wait ``min(MAX, BASE * 2**(attempt - 1))`` seconds before each retry.
+BASE_BACKOFF = dt.timedelta(seconds=1.0)
 # Upper bound so backoff does not grow past a lot.
-MAX_BACKOFF_SECONDS = 8.0
+MAX_BACKOFF = dt.timedelta(seconds=8.0)
 
 # Uniform random extra delay on each backoff (seconds), reduces synchronized retries.
-JITTER_SECONDS = (0.0, 0.6)
+JITTER = (dt.timedelta(seconds=0.0), dt.timedelta(seconds=0.6))
 
 # Error for non-existent packs or invalid DIDs.
 HTTP_STATUS_BAD_REQUEST = 400
@@ -98,9 +99,9 @@ HTTP_STATUS_TOO_MANY_REQUESTS = 429
 HTTP_STATUS_SERVER_ERROR_MIN = 500
 
 # Rate-limit pause: small buffer added to the computed wait so the retry lands after the window resets.
-RATE_LIMIT_BUFFER_SECONDS = 2.0
+RATE_LIMIT_BUFFER = dt.timedelta(seconds=2.0)
 # If the server asks to wait longer than this, abort instead of blocking the terminal.
-RATE_LIMIT_MAX_WAIT_SECONDS = 900.0  # 15 minutes
+RATE_LIMIT_MAX_WAIT = dt.timedelta(minutes=15.0)
 # User agent is initialized once at invocation.
 USER_AGENT = choice(
     (
@@ -116,6 +117,9 @@ USER_AGENT = choice(
         "Mozilla/5.0 (Linux; Android 2.3.5) AppleWebKit/534.1 (KHTML, like Gecko) Chrome/56.0.885.0 Safari/534.1",
     )
 )
+
+# Useful for comparisons.
+ZERO_DURATION = dt.timedelta(0)
 
 
 @dataclass(slots=True)
@@ -205,14 +209,14 @@ class ResolvedListTarget:
     source_kind: SourceKind
 
 
-def parse_delay(value: str) -> float:
+def parse_delay(value: str) -> dt.timedelta:
     """Parse a CLI delay value.
 
     Args:
         value: Raw command-line value for ``--delay``.
 
     Returns:
-        A finite, non-negative delay in seconds.
+        A finite, non-negative delay.
 
     Raises:
         argparse.ArgumentTypeError: If the delay is negative, infinite, or NaN.
@@ -226,7 +230,7 @@ def parse_delay(value: str) -> float:
     if isinf(delay) or isnan(delay):
         msg = "--delay must be a finite number"
         raise argparse.ArgumentTypeError(msg)
-    return delay
+    return dt.timedelta(seconds=delay)
 
 
 def parse_args() -> argparse.Namespace:
@@ -274,7 +278,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--delay",
         type=parse_delay,
-        default=DEFAULT_DELAY_SECONDS,
+        default=DEFAULT_DELAY,
         help="Delay between blocks (seconds)",
     )
 
@@ -322,9 +326,7 @@ def load_inputs_from_file(path: str) -> list[str]:
     if inputs:
         return inputs
 
-    msg = (
-        f"Source file {file_path} does not contain any starter-pack/list inputs"
-    )
+    msg = f"Source file {file_path} does not contain any starter-pack/list inputs"
     raise ValueError(msg)
 
 
@@ -600,7 +602,10 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
     )
 
     try:
-        with urlopen(request, timeout=SHORT_LINK_TIMEOUT_SECONDS) as response:  # noqa: S310
+        with urlopen(  # noqa: S310
+            request,
+            timeout=SHORT_LINK_TIMEOUT.total_seconds(),
+        ) as response:
             body = response.read()
             content_type = response.headers.get("content-type", "")
             if body and "application/json" in content_type:
@@ -913,7 +918,7 @@ def current_time_iso(client: Client) -> str:
         if isinstance(value, str) and value:
             return value
 
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
 def create_block_record(client: Client, did: str) -> None:
@@ -989,7 +994,7 @@ def extract_response_headers(error: Exception) -> dict[str, str]:
     return {}
 
 
-def extract_rate_limit_wait(error: Exception) -> float | None:
+def extract_rate_limit_wait(error: Exception) -> dt.timedelta | None:
     """Compute how long to sleep before the rate-limit window resets.
 
     Reads the ``ratelimit-reset`` header (Unix epoch seconds) first, then
@@ -1000,7 +1005,7 @@ def extract_rate_limit_wait(error: Exception) -> float | None:
         error: Exception raised by the AT Protocol client or network layer.
 
     Returns:
-        Seconds to wait (including buffer), or ``None`` when no usable
+        Duration to wait (including buffer), or ``None`` when no usable
         rate-limit timing is available in the response.
     """
 
@@ -1015,8 +1020,13 @@ def extract_rate_limit_wait(error: Exception) -> float | None:
         except (TypeError, ValueError):
             pass
         else:
-            wait = reset_ts - time.time() + RATE_LIMIT_BUFFER_SECONDS
-            return max(wait, RATE_LIMIT_BUFFER_SECONDS)
+            wait_seconds = reset_ts - time.time()
+            try:
+                wait = dt.timedelta(seconds=wait_seconds) + RATE_LIMIT_BUFFER
+            except (OverflowError, ValueError):
+                pass
+            else:
+                return max(wait, RATE_LIMIT_BUFFER)
 
     retry_after_raw = headers.get("retry-after")
     if retry_after_raw is not None:
@@ -1025,10 +1035,12 @@ def extract_rate_limit_wait(error: Exception) -> float | None:
         except (TypeError, ValueError):
             pass
         else:
-            return max(
-                retry_seconds + RATE_LIMIT_BUFFER_SECONDS,
-                RATE_LIMIT_BUFFER_SECONDS,
-            )
+            try:
+                wait = dt.timedelta(seconds=retry_seconds) + RATE_LIMIT_BUFFER
+            except (OverflowError, ValueError):
+                pass
+            else:
+                return max(wait, RATE_LIMIT_BUFFER)
 
     return None
 
@@ -1127,26 +1139,26 @@ def call_with_rate_limit_retry[T](fn: Callable[[], T], *, context: str) -> T:
             if wait is None:
                 raise
 
-            if wait > RATE_LIMIT_MAX_WAIT_SECONDS:
-                resume_at = datetime.fromtimestamp(
-                    time.time() + wait,
-                    tz=UTC,
+            if wait > RATE_LIMIT_MAX_WAIT:
+                resume_at = dt.datetime.fromtimestamp(
+                    time.time() + wait.total_seconds(),
+                    tz=dt.UTC,
                 ).isoformat()
                 msg = (
                     f"Rate limit for {context} resets at {resume_at} "
-                    f"({wait:.0f}s), exceeds max wait of "
-                    f"{RATE_LIMIT_MAX_WAIT_SECONDS:.0f}s"
+                    f"({wait.total_seconds():.0f}s), exceeds max wait of "
+                    f"{RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s"
                 )
                 raise RuntimeError(msg) from error
 
-            resume_at = datetime.fromtimestamp(
-                time.time() + wait,
-                tz=UTC,
+            resume_at = dt.datetime.fromtimestamp(
+                time.time() + wait.total_seconds(),
+                tz=dt.UTC,
             ).isoformat()
             print(
-                f"RATE LIMITED ({context}): pausing until {resume_at} ({wait:.0f}s)..."
+                f"RATE LIMITED ({context}): pausing until {resume_at} ({wait.total_seconds():.0f}s)..."
             )
-            time.sleep(wait)
+            time.sleep(wait.total_seconds())
 
 
 @dataclass(slots=True)
@@ -1219,28 +1231,28 @@ def _pause_for_rate_limit_if_needed(
     if rate_limit_wait is None:
         return None
 
-    if rate_limit_wait > RATE_LIMIT_MAX_WAIT_SECONDS:
-        resume_at = datetime.fromtimestamp(
-            time.time() + rate_limit_wait,
-            tz=UTC,
+    if rate_limit_wait > RATE_LIMIT_MAX_WAIT:
+        resume_at = dt.datetime.fromtimestamp(
+            time.time() + rate_limit_wait.total_seconds(),
+            tz=dt.UTC,
         ).isoformat()
         print(
             f"ERROR rate limit for {user.handle} ({user.did}) resets at {resume_at}"
-            + f" ({rate_limit_wait:.0f}s), exceeds max wait of"
-            + f" {RATE_LIMIT_MAX_WAIT_SECONDS:.0f}s — aborting"
+            + f" ({rate_limit_wait.total_seconds():.0f}s), exceeds max wait of"
+            + f" {RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s — aborting"
         )
         summary.failed += 1
         failures.append(f"{user.handle} ({user.did})")
         return False
 
-    resume_at = datetime.fromtimestamp(
-        time.time() + rate_limit_wait,
-        tz=UTC,
+    resume_at = dt.datetime.fromtimestamp(
+        time.time() + rate_limit_wait.total_seconds(),
+        tz=dt.UTC,
     ).isoformat()
     print(
-        f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait:.0f}s)..."
+        f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait.total_seconds():.0f}s)..."
     )
-    time.sleep(rate_limit_wait)
+    time.sleep(rate_limit_wait.total_seconds())
     summary.retries += 1
     return True
 
@@ -1260,16 +1272,21 @@ def _pause_before_block_retry(
     """
 
     summary.retries += 1
-    backoff = min(
-        MAX_BACKOFF_SECONDS,
-        BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)),
-    )
-    wait_seconds = backoff + uniform(*JITTER_SECONDS)
+    base_seconds = BASE_BACKOFF.total_seconds()
+    max_seconds = MAX_BACKOFF.total_seconds()
+    backoff_seconds = min(max_seconds, base_seconds * (2 ** (attempt - 1)))
+    backoff = dt.timedelta(seconds=backoff_seconds)
+    jitter_seconds = uniform(*(sec.total_seconds() for sec in JITTER))
+    # jitter_seconds = uniform(
+    #    JITTER[0].total_seconds(),
+    #    JITTER[1].total_seconds(),
+    # )
+    wait = backoff + dt.timedelta(seconds=jitter_seconds)
     print(
         f"WARN transient error for {user.handle} ({user.did}); retry "
-        + f"{attempt}/{MAX_BLOCK_RETRIES} in {wait_seconds:.2f}s"
+        + f"{attempt}/{MAX_BLOCK_RETRIES} in {wait.total_seconds():.2f}s"
     )
-    time.sleep(wait_seconds)
+    time.sleep(wait.total_seconds())
 
 
 def _block_user_with_retries(
@@ -1337,7 +1354,7 @@ def block_users(
     users: list[Member],
     self_did: str,
     blocked_dids: set[str],
-    delay: float,
+    delay: dt.timedelta,
     dry_run: bool,
     is_verbose: bool,
 ) -> BlockResult:
@@ -1392,8 +1409,8 @@ def block_users(
             blocked_dids.add(did)
             summary.blocked += 1
             print(f"BLOCK {handle} ({did})")
-            if delay > 0:
-                time.sleep(delay)
+            if delay > ZERO_DURATION:
+                time.sleep(delay.total_seconds())
 
     return BlockResult(summary=summary, failures=failures)
 
