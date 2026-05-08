@@ -101,7 +101,7 @@ HTTP_STATUS_SERVER_ERROR_MIN = 500
 # Rate-limit pause: small buffer added to the computed wait so the retry lands after the window resets.
 RATE_LIMIT_BUFFER = dt.timedelta(seconds=2.0)
 # If the server asks to wait longer than this, abort instead of blocking the terminal.
-RATE_LIMIT_MAX_WAIT = dt.timedelta(minutes=15.0)
+RATE_LIMIT_MAX_WAIT = dt.timedelta(hours=3)
 # User agent is initialized once at invocation.
 USER_AGENT = choice(
     (
@@ -1139,11 +1139,11 @@ def call_with_rate_limit_retry[T](fn: Callable[[], T], *, context: str) -> T:
             if wait is None:
                 raise
 
+            resume_at = dt.datetime.fromtimestamp(
+                time.time() + wait.total_seconds(),
+                tz=dt.UTC,
+            ).isoformat()
             if wait > RATE_LIMIT_MAX_WAIT:
-                resume_at = dt.datetime.fromtimestamp(
-                    time.time() + wait.total_seconds(),
-                    tz=dt.UTC,
-                ).isoformat()
                 msg = (
                     f"Rate limit for {context} resets at {resume_at} "
                     f"({wait.total_seconds():.0f}s), exceeds max wait of "
@@ -1151,10 +1151,6 @@ def call_with_rate_limit_retry[T](fn: Callable[[], T], *, context: str) -> T:
                 )
                 raise RuntimeError(msg) from error
 
-            resume_at = dt.datetime.fromtimestamp(
-                time.time() + wait.total_seconds(),
-                tz=dt.UTC,
-            ).isoformat()
             print(
                 f"RATE LIMITED ({context}): pausing until {resume_at} ({wait.total_seconds():.0f}s)..."
             )
@@ -1231,11 +1227,11 @@ def _pause_for_rate_limit_if_needed(
     if rate_limit_wait is None:
         return None
 
+    resume_at = dt.datetime.fromtimestamp(
+        time.time() + rate_limit_wait.total_seconds(),
+        tz=dt.UTC,
+    ).isoformat()
     if rate_limit_wait > RATE_LIMIT_MAX_WAIT:
-        resume_at = dt.datetime.fromtimestamp(
-            time.time() + rate_limit_wait.total_seconds(),
-            tz=dt.UTC,
-        ).isoformat()
         print(
             f"ERROR rate limit for {user.handle} ({user.did}) resets at {resume_at}"
             + f" ({rate_limit_wait.total_seconds():.0f}s), exceeds max wait of"
@@ -1245,10 +1241,6 @@ def _pause_for_rate_limit_if_needed(
         failures.append(f"{user.handle} ({user.did})")
         return False
 
-    resume_at = dt.datetime.fromtimestamp(
-        time.time() + rate_limit_wait.total_seconds(),
-        tz=dt.UTC,
-    ).isoformat()
     print(
         f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait.total_seconds():.0f}s)..."
     )
@@ -1277,10 +1269,6 @@ def _pause_before_block_retry(
     backoff_seconds = min(max_seconds, base_seconds * (2 ** (attempt - 1)))
     backoff = dt.timedelta(seconds=backoff_seconds)
     jitter_seconds = uniform(*(sec.total_seconds() for sec in JITTER))
-    # jitter_seconds = uniform(
-    #    JITTER[0].total_seconds(),
-    #    JITTER[1].total_seconds(),
-    # )
     wait = backoff + dt.timedelta(seconds=jitter_seconds)
     print(
         f"WARN transient error for {user.handle} ({user.did}); retry "
