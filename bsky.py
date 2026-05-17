@@ -17,27 +17,28 @@ Supported inputs:
 
 Usage:
     First create an app password in Bluesky under Settings -> Privacy and
-    Security -> App Passwords. Prefer storing it in an environment variable so
-    it does not appear in shell history or process listings:
+    Security -> App Passwords. Then set that password and your handle in the environment:
 
-    ``export BSKY_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"``
+    ```
+    export BSKY_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+    export BSKY_HANDLE="your.handle.bsky.social"
+    ```
 
     Run a dry run before blocking:
 
-    ``python3 bsky.py --handle user.bsky.social --input <url-or-at-uri> --dry-run``
+    ``python3 bsky.py --input <url-or-at-uri> --dry-run``
 
     Or load pack inputs from a file (one input per line):
 
-    ``python3 bsky.py --handle user.bsky.social --file inputs.txt --dry-run``
+    ``python3 bsky.py --file inputs.txt --dry-run``
 
     ``--input`` and ``--file`` are mutually exclusive.
 
     If the dry run looks correct, run without ``--dry-run``:
 
-    ``python3 bsky.py --handle user.bsky.social --input <url-or-at-uri>``
+    ``python3 bsky.py --input <url-or-at-uri>``
 
     You can pass ``--delay`` to control the pause between block operations.
-    ``--app-password`` is supported, but the environment variable is safer.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import textwrap
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -225,10 +227,10 @@ def parse_delay(value: str) -> dt.timedelta:
 
     delay = float(value)
     if delay < 0:
-        msg = "--delay must be greater than or equal to 0"
+        msg = "delay must be greater than or equal to 0"
         raise argparse.ArgumentTypeError(msg)
     if isinf(delay) or isnan(delay):
-        msg = "--delay must be a finite number"
+        msg = "delay must be a finite number"
         raise argparse.ArgumentTypeError(msg)
     return dt.timedelta(seconds=delay)
 
@@ -243,20 +245,14 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description="Block all users from one or more Bluesky starter packs or lists",
-    )
-
-    parser.add_argument(
-        "--handle",
-        required=True,
-        type=str,
-        help="Bluesky handle (e.g. user.bsky.social)",
-    )
-
-    parser.add_argument(
-        "--app-password",
-        type=str,
-        default=None,
-        help="Bluesky app password (or set BSKY_APP_PASSWORD)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            textwrap.dedent(
+                """Needed enviroment variables:
+    - BSKY_APP_PASSWORD: Bluesky app password
+    - BSKY_HANDLE: Bluesky handle"""
+            )
+        ),
     )
 
     pack_input_group = parser.add_mutually_exclusive_group(required=True)
@@ -330,11 +326,17 @@ def load_inputs_from_file(path: str) -> list[str]:
     raise ValueError(msg)
 
 
-def resolve_app_password(cli_password: str | None) -> str:
-    """Resolve the Bluesky app password from CLI input or environment.
+def resolve_handle() -> str:
+    """Resolve the Bluesky handle from the environment."""
+    handle = os.getenv("BSKY_HANDLE")
+    if not handle:
+        msg = "Missing Bluesky handle. Set BSKY_HANDLE."
+        raise ValueError(msg)
+    return handle
 
-    Args:
-        cli_password: Password passed through ``--app-password``.
+
+def resolve_app_password() -> str:
+    """Resolve the Bluesky app password from the environment.
 
     Returns:
         The app password to use for login.
@@ -344,15 +346,11 @@ def resolve_app_password(cli_password: str | None) -> str:
             set.
     """
 
-    if cli_password:
-        return cli_password
-
     env_password = os.getenv("BSKY_APP_PASSWORD")
-    if env_password:
-        return env_password
-
-    msg = "Missing app password. Provide --app-password or set BSKY_APP_PASSWORD."
-    raise ValueError(msg)
+    if not env_password:
+        msg = "Missing app password. Set BSKY_APP_PASSWORD."
+        raise ValueError(msg)
+    return env_password
 
 
 def supported_input_format_error() -> str:
@@ -1442,8 +1440,8 @@ def main() -> None:
 
     args = parse_args()
 
-    app_password = resolve_app_password(args.app_password)
-    client, self_did = login(args.handle, app_password)
+    app_password = resolve_app_password()
+    client, self_did = login(resolve_handle(), app_password)
 
     source_inputs: list[str]
     if args.input is not None:

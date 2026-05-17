@@ -23,10 +23,16 @@ python3 -m pip install "atproto>=0.0.65"
 ## Setup
 
 1. In Bluesky: **Settings -> Privacy and security -> App passwords** - create an app password.
-2. Prefer passing it via environment (avoids shell history and process lists):
+2. Set the app password in the environment:
 
    ```bash
    export BSKY_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+   ```
+
+3. Set your Bluesky handle in the environment:
+
+   ```bash
+   export BSKY_HANDLE="your.handle.bsky.social"
    ```
 
 ## Usage
@@ -34,25 +40,25 @@ python3 -m pip install "atproto>=0.0.65"
 Run a **dry run** first (no blocks are created):
 
 ```bash
-python3 bsky.py --handle your.handle.bsky.social --input "<starter-pack-or-list-link>" --dry-run
+python3 bsky.py --input "<starter-pack-or-list-link>" --dry-run
 ```
 
 If you want a line-per-account listing of what would be blocked, add `--verbose`:
 
 ```bash
-python3 bsky.py --handle your.handle.bsky.social --input "<starter-pack-or-list-link>" --dry-run --verbose
+python3 bsky.py --input "<starter-pack-or-list-link>" --dry-run --verbose
 ```
 
 If the output looks right, run without `--dry-run`:
 
 ```bash
-python3 bsky.py --handle your.handle.bsky.social --input "<starter-pack-or-list-link>"
+python3 bsky.py --input "<starter-pack-or-list-link>"
 ```
 
 Use more than one source by putting one input per line in a file:
 
 ```bash
-python3 bsky.py --handle your.handle.bsky.social --file inputs.txt --dry-run --verbose
+python3 bsky.py --file inputs.txt --dry-run --verbose
 ```
 
 ## Supported input formats
