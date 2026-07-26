@@ -84,7 +84,7 @@ python3 bsky.py --file inputs.txt --dry-run --verbose
 ## Flags
 
 | Flag | Description |
-|---|---|
+| --- | --- |
 | `-i`/`--input` | Single starter-pack/list URL or AT URI (mutually exclusive with `--file`). |
 | `-f`/`--file` | UTF-8 text file with one URL/AT URI per line (max 10 MiB). |
 | `--delay` | Seconds to sleep between successful blocks (default `0.5`). |
@@ -96,7 +96,7 @@ python3 bsky.py --file inputs.txt --dry-run --verbose
 ## Exit codes
 
 | Code | Meaning |
-|---|---|
+| --- | --- |
 | 0 | Every member processed without failures. |
 | 1 | At least one block attempt failed. |
 | 2 | The destructive confirmation prompt was declined, or stdin was not a TTY without `--yes`. |

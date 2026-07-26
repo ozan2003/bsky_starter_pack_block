@@ -360,7 +360,7 @@ def parse_args() -> argparse.Namespace:
         "--quiet",
         action="store_true",
         default=False,
-        help="Suppress per-account lines; only print the summary",
+        help="Suppress per-account lines, only print the summary",
     )
 
     parser.add_argument(
@@ -1781,8 +1781,8 @@ def _print_progress(
 
     label = "would" if dry_run else "blocked"
     line = (
-        f"[{label} {completed}/{total} · retries {retries}"
-        f" · skipped {skipped_invalid}]"
+        f"[{label} {completed}/{total} - retries {retries}"
+        f" - skipped {skipped_invalid}]"
     )
     sys.stderr.write(line + "\n")
     sys.stderr.flush()
