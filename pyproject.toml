@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 dependencies = ["atproto>=0.0.65"]
 
 [dependency-groups]
-dev = ["basedpyright>=1.39.0", "ruff>=0.2.2", "vermin>=1.7.0"]
+dev = ["pyrefly", "ruff>=0.2.2", "vermin>=1.7.0"]
 
 [tool.ruff]
 line-length = 79
@@ -57,12 +57,24 @@ ignore = [
     "S311",
 ]
 
-[tool.basedpyright]
-pythonVersion = "3.12"
-include = ["bsky.py"]
-exclude = ["**/__pycache__/**", ".venv"]
-stubPath = "stubs"
-typeCheckingMode = "recommended"
-reportUnusedCallResult = "none"
-reportExplicitAny = "none"
-reportAny = "none"
+[tool.pyrefly]
+project-includes = ["bsky.py"]
+project-excludes = [".venv"]
+python-version = "3.12"
+site-package-path = ["stubs"]
+preset = "strict"
+
+[tool.pyrefly.errors]
+assert-type = true
+bad-override = true
+bad-specialization = true
+bad-context-manager = true
+implicitly-defined-attribute = true
+inconsistent-overload = true
+invalid-overload = true
+missing-attribute = true
+no-access = true
+redundant-cast = true
+unbound-name = true
+implicit-any-attribute = true
+untyped-import = true
