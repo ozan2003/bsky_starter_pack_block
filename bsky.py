@@ -47,7 +47,7 @@ import argparse
 import datetime as dt
 import json
 import os
-import textwrap
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -61,14 +61,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-# pyrefly: ignore [missing-import]
 from atproto import Client, models
-# pyrefly: ignore [missing-import]
 from atproto.exceptions import (
     AtProtocolError,
     BadRequestError,
     NetworkError,
     RequestException,
+    UnauthorizedError,
 )
 
 try:
@@ -87,6 +86,18 @@ STARTER_PACK_SHORT_PATH = "starter-pack-short"
 
 # Socket timeout for urllib when resolving short links (go.bsky.app redirects).
 SHORT_LINK_TIMEOUT = dt.timedelta(seconds=10.0)
+
+# Maximum size of the input file in bytes; anything larger is rejected before
+# opening so a 5GB paste cannot OOM the process.
+MAX_INPUT_FILE_SIZE = 10 * 1024 * 1024  # 10 MiB
+
+# Maximum length of a single AT URI segment (identifier, rkey). Keeps a
+# hostile 1MB identifier from making the parser do useless work.
+MAX_AT_URI_SEGMENT_LENGTH = 512
+
+# A progress line is emitted to stderr every N successful blocks (or, in
+# dry-run, every N would-blocks). Set to 0 to disable progress output.
+PROGRESS_EVERY = 25
 
 # Maximum records per page for listRepos/listRecords-style reads.
 LIST_PAGE_SIZE = 100
@@ -134,7 +145,9 @@ class BlockListCapError(Exception):
     """Raised when the PDS rejects a block because the user hit the per-account cap."""
 
     def __init__(self, did: str, handle: str) -> None:
-        super().__init__(f"Block list cap reached while blocking {handle} ({did})")
+        super().__init__(
+            f"Block list cap reached while blocking {handle} ({did})"
+        )
         self.did = did
         self.handle = handle
 
@@ -168,6 +181,7 @@ class BlockSummary:
         blocked: Number of block records created successfully.
         failed: Number of members that could not be blocked.
         retries: Number of retry attempts used for transient block failures.
+        reauths: Number of re-authentications triggered by an expired session.
     """
 
     discovered: int = 0
@@ -178,6 +192,7 @@ class BlockSummary:
     blocked: int = 0
     failed: int = 0
     retries: int = 0
+    reauths: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +237,30 @@ class BlockOutcome(StrEnum):
     BLOCKED = "blocked"
     SKIPPED_INVALID = "skipped_invalid"
     FAILED = "failed"
+
+
+def confirm_destructive(count: int) -> bool:
+    """Prompt the user before blocking ``count`` accounts.
+
+    Returns ``True`` if the user typed ``y``/``yes`` (case-insensitive).
+    Returns ``False`` for any other response.
+
+    Raises:
+        SystemExit: With code ``2`` if stdin is not a TTY (e.g. cron / CI),
+            so a destructive run is never launched silently.
+    """
+
+    if not sys.stdin.isatty():
+        print(
+            f"ERROR: refusing to block {count} accounts without a TTY."
+            " Pass --yes to confirm non-interactively.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    print(f"About to block {count} accounts. Continue? [y/N]")
+    response = input().strip().lower()
+    return response in {"y", "yes"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,13 +310,11 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description="Block all users from one or more Bluesky starter packs or lists",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
-            textwrap.dedent(
-                """Needed enviroment variables:
-    - BSKY_APP_PASSWORD: Bluesky app password
-    - BSKY_HANDLE: Bluesky handle"""
-            )
+            "Needed enviroment variables:\n"
+            "    - BSKY_APP_PASSWORD: Bluesky app password\n"
+            "    - BSKY_HANDLE: Bluesky handle\n"
         ),
     )
 
@@ -306,8 +343,24 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print users without blocking (use --no-dry-run to actually block)",
+    )
+
+    parser.add_argument(
+        "-y",
+        "--yes",
         action="store_true",
-        help="Print users without blocking",
+        default=False,
+        help="Skip the confirmation prompt before blocking",
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        default=False,
+        help="Suppress per-account lines; only print the summary",
     )
 
     parser.add_argument(
@@ -324,7 +377,11 @@ def parse_args() -> argparse.Namespace:
 def load_inputs_from_file(path: str) -> list[str]:
     """Load starter-pack/list inputs from a UTF-8 text file.
 
-    Note that it won't do any normalization or validation of the inputs.
+    The file is stat-checked first and rejected if it exceeds
+    :data:`MAX_INPUT_FILE_SIZE`, so a multi-gigabyte paste cannot OOM the
+    process before the read begins.
+
+    Note that this function does not normalize or validate the inputs.
     Refer to ``normalize_input_uri`` for more information.
 
     Args:
@@ -334,10 +391,24 @@ def load_inputs_from_file(path: str) -> list[str]:
         Non-empty input lines with surrounding whitespace removed.
 
     Raises:
-        ValueError: If the file cannot be read or contains no usable pack lines.
+        ValueError: If the file is missing, exceeds the size cap, cannot be
+            read, or contains no usable pack lines.
     """
 
     file_path = Path(path)
+    try:
+        size = file_path.stat().st_size
+    except OSError as error:
+        msg = f"Could not stat source file {file_path}: {error}"
+        raise ValueError(msg) from error
+
+    if size > MAX_INPUT_FILE_SIZE:
+        msg = (
+            f"Source file {file_path} is {size} bytes, exceeding the "
+            f"{MAX_INPUT_FILE_SIZE}-byte cap. Refusing to read."
+        )
+        raise ValueError(msg)
+
     try:
         with file_path.open(encoding="utf-8") as fp:
             inputs = [stripped for line in fp if (stripped := line.strip())]
@@ -409,8 +480,8 @@ def parse_at_uri(raw: str) -> PackReference | None:
         ``None``.
 
     Raises:
-        ValueError: If ``raw`` is an AT URI but has the wrong shape or
-            collection.
+        ValueError: If ``raw`` is an AT URI but has the wrong shape, an
+            unsupported collection, or an over-long segment.
     """
 
     if not raw.startswith("at://"):
@@ -419,18 +490,26 @@ def parse_at_uri(raw: str) -> PackReference | None:
     parts = [part for part in raw[len("at://") :].split("/") if part]
     if len(parts) != 3:
         msg = (
-            "AT URI must be in the format "
-            "at://<did-or-handle>/<collection>/<rkey>"
+            f"AT URI must have exactly 3 segments (did-or-handle, collection,"
+            f" rkey); got {len(parts)}: {raw!r}"
         )
         raise ValueError(msg)
 
     identifier, collection, rkey = parts
     if collection not in {STARTER_PACK_COLLECTION, LIST_COLLECTION}:
         msg = (
-            "AT URI must use collection "
-            + f"{STARTER_PACK_COLLECTION} or {LIST_COLLECTION}"
+            f"AT URI must use collection {STARTER_PACK_COLLECTION} or"
+            f" {LIST_COLLECTION}; got {collection!r}"
         )
         raise ValueError(msg)
+
+    for label, value in (("identifier", identifier), ("rkey", rkey)):
+        if len(value) > MAX_AT_URI_SEGMENT_LENGTH:
+            msg = (
+                f"AT URI {label} is {len(value)} chars, exceeding the "
+                f"{MAX_AT_URI_SEGMENT_LENGTH}-char cap"
+            )
+            raise ValueError(msg)
 
     return PackReference(
         identifier=identifier,
@@ -482,6 +561,13 @@ def parse_list_path(path_source: str) -> PackReference | None:
         return None
 
     _, identifier, _, rkey = parts
+    for label, value in (("identifier", identifier), ("rkey", rkey)):
+        if len(value) > MAX_AT_URI_SEGMENT_LENGTH:
+            msg = (
+                f"List path {label} is {len(value)} chars, exceeding the "
+                f"{MAX_AT_URI_SEGMENT_LENGTH}-char cap"
+            )
+            raise ValueError(msg)
     return PackReference(
         identifier=identifier,
         rkey=rkey,
@@ -658,12 +744,18 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
     raise RuntimeError(msg)
 
 
-def resolve_identifier_to_did(client: Client, identifier: str) -> str:
+def resolve_identifier_to_did(
+    client: Client,
+    identifier: str,
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> str:
     """Resolve a handle-like identifier to a DID.
 
     Args:
         client: Authenticated AT Protocol client.
         identifier: DID or Bluesky handle.
+        reauth: Optional one-shot re-authentication callback for 401s.
 
     Returns:
         A DID suitable for building an AT URI.
@@ -678,6 +770,7 @@ def resolve_identifier_to_did(client: Client, identifier: str) -> str:
     response = call_with_rate_limit_retry(
         lambda: client.resolve_handle(identifier),
         context="resolve handle",
+        reauth=reauth,
     )
     if response.did:
         return response.did
@@ -686,7 +779,12 @@ def resolve_identifier_to_did(client: Client, identifier: str) -> str:
     raise RuntimeError(msg)
 
 
-def normalize_input_uri(client: Client, source_input: str) -> PackReference:
+def normalize_input_uri(
+    client: Client,
+    source_input: str,
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> PackReference:
     """Normalize a supported input into a canonical ``PackReference``.
 
     Args:
@@ -694,6 +792,7 @@ def normalize_input_uri(client: Client, source_input: str) -> PackReference:
             resolution.
         source_input: Starter-pack/list AT URI, canonical Bluesky URL, or short
             link.
+        reauth: Optional one-shot re-authentication callback for 401s.
 
     Returns:
         A ``PackReference`` with the resolved DID, collection, and rkey.
@@ -714,7 +813,9 @@ def normalize_input_uri(client: Client, source_input: str) -> PackReference:
 
         # The graph API requires the creator DID in the AT URI; web links
         # may contain a handle, so resolve that as the final parse step.
-        did = resolve_identifier_to_did(client, parsed_input.identifier)
+        did = resolve_identifier_to_did(
+            client, parsed_input.identifier, reauth=reauth
+        )
         return PackReference(
             identifier=did,
             rkey=parsed_input.rkey,
@@ -767,12 +868,66 @@ def login(handle: str, app_password: str) -> tuple[Client, str]:
     return client, did
 
 
-def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
+def _make_reauth_fn(
+    client: Client,
+    handle: str,
+    app_password: str,
+    summary: BlockSummary,
+) -> Callable[[], bool]:
+    """Build a one-shot re-authentication callback for the current run.
+
+    The access token can be revoked or expire mid-run (especially on long
+    runs). The SDK raises ``UnauthorizedError`` (HTTP 401) when it tries to
+    use a stale session. This helper re-issues ``client.login`` with the
+    already-resolved env credentials, then lets the caller retry the failed
+    operation.
+
+    The once-per-run cap is implemented via a closure flag so a flapping PDS
+    can't trap us in a re-auth loop. After a successful re-auth, subsequent
+    401s propagate normally and are recorded as failures.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        handle: Bluesky handle used at startup.
+        app_password: App password used at startup.
+        summary: Run summary; ``reauths`` is incremented on success.
+
+    Returns:
+        A zero-arg callable returning ``True`` if a re-authentication was
+        performed (caller should retry) and ``False`` if a re-auth was
+        already done earlier in this run.
+    """
+
+    reauth_used = [False]
+
+    def reauth() -> bool:
+        if reauth_used[0]:
+            return False
+        client.login(handle, app_password)
+        reauth_used[0] = True
+        summary.reauths += 1
+        _emit(
+            "INFO: re-authenticated (session expired)",
+            quiet=False,
+            force=True,
+        )
+        return True
+
+    return reauth
+
+
+def fetch_starter_pack_list_uri(
+    client: Client,
+    at_uri: str,
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> str:
     """Fetch the backing list URI for a starter pack.
 
     Args:
         client: Authenticated AT Protocol client.
         at_uri: Starter pack AT URI.
+        reauth: Optional one-shot re-authentication callback for 401s.
 
     Returns:
         The AT URI of the list that contains the starter pack accounts.
@@ -786,6 +941,7 @@ def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
     response = call_with_rate_limit_retry(
         lambda: client.app.bsky.graph.get_starter_pack(params),
         context="fetch starter pack",
+        reauth=reauth,
     )
 
     starter_pack = response.starter_pack
@@ -803,13 +959,17 @@ def fetch_starter_pack_list_uri(client: Client, at_uri: str) -> str:
 
 
 def resolve_input_to_list_target(
-    client: Client, source_input: str
+    client: Client,
+    source_input: str,
+    *,
+    reauth: Callable[[], bool] | None = None,
 ) -> ResolvedListTarget:
     """Resolve any supported input into a list URI target.
 
     Args:
         client: Authenticated AT Protocol client.
-        pack_input: Raw user input identifying a starter pack or list.
+        source_input: Raw user input identifying a starter pack or list.
+        reauth: Optional one-shot re-authentication callback for 401s.
 
     Returns:
         A list target with source metadata for logging.
@@ -820,13 +980,13 @@ def resolve_input_to_list_target(
         ValueError: If the input format is unsupported.
     """
 
-    reference = normalize_input_uri(client, source_input)
+    reference = normalize_input_uri(client, source_input, reauth=reauth)
     at_uri = (
         f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
     )
 
     if reference.collection == STARTER_PACK_COLLECTION:
-        list_uri = fetch_starter_pack_list_uri(client, at_uri)
+        list_uri = fetch_starter_pack_list_uri(client, at_uri, reauth=reauth)
         return ResolvedListTarget(
             list_uri=list_uri, source_kind=SourceKind.STARTER_PACK
         )
@@ -834,12 +994,18 @@ def resolve_input_to_list_target(
     return ResolvedListTarget(list_uri=at_uri, source_kind=SourceKind.LIST)
 
 
-def fetch_list_members(client: Client, list_uri: str) -> list[Member]:
+def fetch_list_members(
+    client: Client,
+    list_uri: str,
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> list[Member]:
     """Load all unique account members from a list.
 
     Args:
         client: Authenticated AT Protocol client.
         list_uri: List AT URI.
+        reauth: Optional one-shot re-authentication callback for 401s.
 
     Returns:
         Unique list members keyed by DID.
@@ -857,6 +1023,7 @@ def fetch_list_members(client: Client, list_uri: str) -> list[Member]:
         response = call_with_rate_limit_retry(
             lambda params=params: client.app.bsky.graph.get_list(params),
             context="fetch members page",
+            reauth=reauth,
         )
         for item in response.items:
             subject = item.subject
@@ -890,11 +1057,16 @@ def merge_unique_members(
         merged.setdefault(member.did, member)
 
 
-def fetch_blocked_dids(client: Client) -> set[str]:
+def fetch_blocked_dids(
+    client: Client,
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> set[str]:
     """Load all DIDs already blocked by the signed-in account.
 
     Args:
         client: Authenticated AT Protocol client.
+        reauth: Optional one-shot re-authentication callback for 401s.
 
     Returns:
         DIDs for accounts that are already blocked.
@@ -911,6 +1083,7 @@ def fetch_blocked_dids(client: Client) -> set[str]:
         response = call_with_rate_limit_retry(
             lambda params=params: client.app.bsky.graph.get_blocks(params),
             context="fetch blocks page",
+            reauth=reauth,
         )
         for block in response.blocks:
             if block.did:
@@ -1140,7 +1313,9 @@ def is_block_list_cap_error(error: BaseException) -> bool:
     """
 
     response = getattr(error, "response", None)
-    content = getattr(response, "content", None) if response is not None else None
+    content = (
+        getattr(response, "content", None) if response is not None else None
+    )
 
     error_code: str | None = None
     if isinstance(content, dict):
@@ -1186,20 +1361,59 @@ def is_bad_request_skip(error: Exception) -> bool:
         or unreachable target.
     """
 
-    return extract_status_code(error) == HTTP_STATUS_BAD_REQUEST
+    return isinstance(error, BadRequestError) or (
+        isinstance(error, RequestException)
+        and extract_status_code(error) == HTTP_STATUS_BAD_REQUEST
+    )
 
 
-def call_with_rate_limit_retry[T](fn: Callable[[], T], *, context: str) -> T:
+def is_input_unrecoverable(error: BaseException) -> bool:
+    """Decide whether an input-resolution error should skip the input.
+
+    Used in :func:`main` to recover from permanently-broken input sources
+    (deleted starter pack, deleted list) without aborting the whole run.
+    Treats the following as recoverable:
+
+    - ``BadRequestError`` (HTTP 400: bad rkey, deleted record, etc.)
+    - ``RequestException`` with status 404 (record not found / deleted)
+
+    Args:
+        error: Exception raised by the AT Protocol client.
+
+    Returns:
+        ``True`` when the input source is permanently broken and the
+        caller should skip it and continue.
+    """
+
+    if isinstance(error, BadRequestError):
+        return True
+    if isinstance(error, RequestException):
+        return extract_status_code(error) == 404
+    return False
+
+
+def call_with_rate_limit_retry[T](
+    fn: Callable[[], T],
+    *,
+    context: str,
+    reauth: Callable[[], bool] | None = None,
+) -> T:
     """Call ``fn`` and transparently pause on HTTP 429 rate limits.
 
     On a 429 response the function reads ``ratelimit-reset`` (or
     ``retry-after``) from the response headers, sleeps until the window
-    resets, and retries.  Non-429 exceptions propagate immediately.
+    resets, and retries.  On an ``UnauthorizedError`` (HTTP 401) the optional
+    ``reauth`` callback is invoked; if it returns ``True`` (a re-auth just
+    succeeded) the function is retried once, otherwise the exception
+    propagates.
 
     Args:
         fn: Zero-argument callable that performs a single API request.
         context: Human-readable label printed while pausing (e.g.
             ``"fetch members page"``).
+        reauth: Optional callback that re-authenticates the client and
+            returns ``True`` if the caller should retry. When ``None``,
+            401s propagate as normal errors.
 
     Returns:
         The return value of ``fn`` on success.
@@ -1213,6 +1427,12 @@ def call_with_rate_limit_retry[T](fn: Callable[[], T], *, context: str) -> T:
         try:
             return fn()
         except Exception as error:
+            if (
+                isinstance(error, UnauthorizedError)
+                and reauth is not None
+                and reauth()
+            ):
+                continue
             status_code = extract_status_code(error)
             if status_code != HTTP_STATUS_TOO_MANY_REQUESTS:
                 raise
@@ -1265,6 +1485,7 @@ def _record_block_failure(
     user: Member,
     error: Exception,
     is_verbose: bool,
+    is_quiet: bool = False,
 ) -> None:
     """Record and print a failed block attempt.
 
@@ -1274,15 +1495,18 @@ def _record_block_failure(
         user: Starter pack member whose block attempt failed.
         error: Exception raised by the block operation.
         is_verbose: When ``True``, include the described error in output.
+        is_quiet: When ``True``, suppress the per-account line.
     """
 
     error_text = describe_error(error)
     summary.failed += 1
     failures.append(f"{user.handle} ({user.did})")
     if is_verbose:
-        print(f"ERROR {user.handle} ({user.did}) -> {error_text}")
+        _emit(
+            f"ERROR {user.handle} ({user.did}) -> {error_text}", quiet=is_quiet
+        )
     else:
-        print(f"ERROR {user.handle} ({user.did})")
+        _emit(f"ERROR {user.handle} ({user.did})", quiet=is_quiet)
 
 
 def _pause_for_rate_limit_if_needed(
@@ -1291,6 +1515,7 @@ def _pause_for_rate_limit_if_needed(
     user: Member,
     summary: BlockSummary,
     failures: list[str],
+    is_quiet: bool = False,
 ) -> bool | None:
     """Pause for a rate-limit response when retry timing is available.
 
@@ -1299,7 +1524,8 @@ def _pause_for_rate_limit_if_needed(
         user: Starter pack member being blocked.
         summary: Mutable run summary updated with retry or failure counts.
         failures: Mutable list receiving a failed account entry when the
-            rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT_SECONDS``.
+            rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT``.
+        is_quiet: When ``True``, suppress the per-user "aborting" error line.
 
     Returns:
         ``True`` when the caller should retry immediately after the pause,
@@ -1320,17 +1546,21 @@ def _pause_for_rate_limit_if_needed(
         tz=dt.UTC,
     ).isoformat()
     if rate_limit_wait > RATE_LIMIT_MAX_WAIT:
-        print(
+        _emit(
             f"ERROR rate limit for {user.handle} ({user.did}) resets at {resume_at}"
             + f" ({rate_limit_wait.total_seconds():.0f}s), exceeds max wait of"
-            + f" {RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s — aborting"
+            + f" {RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s — aborting",
+            quiet=is_quiet,
+            force=True,
         )
         summary.failed += 1
         failures.append(f"{user.handle} ({user.did})")
         return False
 
-    print(
-        f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait.total_seconds():.0f}s)..."
+    _emit(
+        f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait.total_seconds():.0f}s)...",
+        quiet=is_quiet,
+        force=True,
     )
     time.sleep(rate_limit_wait.total_seconds())
     summary.retries += 1
@@ -1373,6 +1603,8 @@ def _block_user_with_retries(
     failures: list[str],
     skipped: list[str],
     is_verbose: bool,
+    is_quiet: bool = False,
+    reauth: Callable[[], bool] | None = None,
 ) -> BlockOutcome:
     """Block one user, retrying transient failures.
 
@@ -1394,6 +1626,8 @@ def _block_user_with_retries(
         failures: Mutable list receiving failed account entries.
         skipped: Mutable list receiving skipped-invalid account entries.
         is_verbose: When ``True``, include detailed error text in output.
+        is_quiet: When ``True``, suppress per-account output lines.
+        reauth: Optional one-shot re-authentication callback for 401s.
 
     Returns:
         The outcome of the block attempt.
@@ -1403,17 +1637,33 @@ def _block_user_with_retries(
     while attempt < MAX_BLOCK_ATTEMPTS:
         try:
             response = create_block_record(client, user.did)
+        except UnauthorizedError as error:
+            if reauth is not None and reauth():
+                continue
+            _record_block_failure(
+                summary=summary,
+                failures=failures,
+                user=user,
+                error=error,
+                is_verbose=is_verbose,
+                is_quiet=is_quiet,
+            )
+            return BlockOutcome.FAILED
         except BadRequestError as error:
             if is_block_list_cap_error(error):
                 raise BlockListCapError(user.did, user.handle) from error
             summary.skipped_invalid += 1
             skipped.append(f"{user.handle} ({user.did})")
             if is_verbose:
-                print(
-                    f"SKIP invalid {user.handle} ({user.did}) -> {describe_error(error)}"
+                _emit(
+                    f"SKIP invalid {user.handle} ({user.did}) -> {describe_error(error)}",
+                    quiet=is_quiet,
                 )
             else:
-                print(f"SKIP invalid {user.handle} ({user.did})")
+                _emit(
+                    f"SKIP invalid {user.handle} ({user.did})",
+                    quiet=is_quiet,
+                )
             return BlockOutcome.SKIPPED_INVALID
         except AtProtocolError as error:
             if not is_transient_error(error):
@@ -1423,6 +1673,7 @@ def _block_user_with_retries(
                     user=user,
                     error=error,
                     is_verbose=is_verbose,
+                    is_quiet=is_quiet,
                 )
                 return BlockOutcome.FAILED
 
@@ -1433,6 +1684,7 @@ def _block_user_with_retries(
                     user=user,
                     error=error,
                     is_verbose=is_verbose,
+                    is_quiet=is_quiet,
                 )
                 return BlockOutcome.FAILED
 
@@ -1441,6 +1693,7 @@ def _block_user_with_retries(
                 user=user,
                 summary=summary,
                 failures=failures,
+                is_quiet=is_quiet,
             )
             if rate_limit_result is False:
                 return BlockOutcome.FAILED
@@ -1461,6 +1714,7 @@ def _block_user_with_retries(
                 user=user,
                 error=error,
                 is_verbose=is_verbose,
+                is_quiet=is_quiet,
             )
             return BlockOutcome.FAILED
 
@@ -1471,11 +1725,67 @@ def _block_user_with_retries(
                 user=user,
                 error=RuntimeError("Block record created without a CID"),
                 is_verbose=is_verbose,
+                is_quiet=is_quiet,
             )
             return BlockOutcome.FAILED
         return BlockOutcome.BLOCKED
 
     return BlockOutcome.FAILED
+
+
+def _emit(msg: str, *, quiet: bool, force: bool = False) -> None:
+    """Print ``msg`` to stdout unless ``quiet`` is set.
+
+    Operational lines (rate limits, warnings, errors, cap-reached aborts) call
+    with ``force=True`` so they always print even in ``--quiet`` mode.
+    Per-account lines (BLOCK / SKIP / DRY BLOCK) call with ``force=False``
+    (the default) and are suppressed in ``--quiet`` mode.
+    """
+
+    if not quiet or force:
+        print(msg)
+
+
+def _print_progress(
+    *,
+    completed: int,
+    total: int,
+    retries: int,
+    skipped_invalid: int,
+    is_quiet: bool,
+    dry_run: bool,
+) -> None:
+    """Write a periodic progress line to stderr.
+
+    Suppressed when ``is_quiet`` is true, when :data:`PROGRESS_EVERY` is 0,
+    or when the interval has not yet been hit. In dry-run the count tracks
+    ``would_block`` rather than ``blocked`` so users can still see forward
+    progress without any blocks actually happening.
+
+    The line is written with a trailing newline so progress history is
+    preserved in non-TTY contexts (CI, redirected stderr).
+
+    Args:
+        completed: Number of successful blocks (or would-blocks in dry-run).
+        total: Total accounts eligible to be blocked.
+        retries: Current retry count.
+        skipped_invalid: Current skipped-invalid count.
+        is_quiet: When ``True``, do nothing.
+        dry_run: When ``True``, label the counter as "would".
+    """
+
+    if is_quiet or PROGRESS_EVERY <= 0 or total <= 0:
+        return
+    if completed == 0 or completed % PROGRESS_EVERY != 0:
+        return
+
+    label = "would" if dry_run else "blocked"
+    line = (
+        f"[{label} {completed}/{total} · retries {retries}"
+        f" · skipped {skipped_invalid}]"
+    )
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
 
 
 def block_users(
@@ -1487,6 +1797,9 @@ def block_users(
     delay: dt.timedelta,
     dry_run: bool,
     is_verbose: bool,
+    is_quiet: bool = False,
+    reauth: Callable[[], bool] | None = None,
+    summary: BlockSummary,
 ) -> BlockResult:
     """Block each eligible starter pack member.
 
@@ -1500,13 +1813,17 @@ def block_users(
         dry_run: When ``True``, print intended actions without creating block
             records.
         is_verbose: When ``True``, print verbose output.
+        is_quiet: When ``True``, suppress per-account lines.
+        reauth: Optional one-shot re-authentication callback for 401s.
+        summary: Mutable run summary to update in place. ``discovered`` is
+            set to ``len(users)`` at the start.
 
     Returns:
         A summary of the run, human-readable failure and skipped entries, and
         a flag indicating whether the block-list cap was reached.
     """
 
-    summary = BlockSummary(discovered=len(users))
+    summary.discovered = len(users)
     failures: list[str] = []
     skipped: list[str] = []
     cap_reached = False
@@ -1517,18 +1834,30 @@ def block_users(
 
         if did == self_did:
             summary.skipped_self += 1
-            print(f"SKIP self {handle} ({did})")
+            _emit(f"SKIP self {handle} ({did})", quiet=is_quiet)
             continue
 
         if did in blocked_dids:
             summary.skipped_already_blocked += 1
-            print(f"SKIP already blocked {handle} ({did})")
+            _emit(f"SKIP already blocked {handle} ({did})", quiet=is_quiet)
             continue
 
         if dry_run:
             summary.would_block += 1
             if is_verbose:
-                print(f"DRY BLOCK {handle} ({did})")
+                _emit(f"DRY BLOCK {handle} ({did})", quiet=is_quiet)
+            _print_progress(
+                completed=summary.would_block,
+                total=sum(
+                    1
+                    for u in users
+                    if u.did != self_did and u.did not in blocked_dids
+                ),
+                retries=summary.retries,
+                skipped_invalid=summary.skipped_invalid,
+                is_quiet=is_quiet,
+                dry_run=True,
+            )
             continue
 
         try:
@@ -1539,26 +1868,45 @@ def block_users(
                 failures=failures,
                 skipped=skipped,
                 is_verbose=is_verbose,
+                is_quiet=is_quiet,
+                reauth=reauth,
             )
         except BlockListCapError:
             summary.failed += 1
             failures.append(f"{user.handle} ({user.did})")
             cap_reached = True
-            print(
-                f"ERROR block list cap reached while blocking {user.handle} ({user.did})"
+            _emit(
+                f"ERROR block list cap reached while blocking {handle} ({did})",
+                quiet=is_quiet,
+                force=True,
             )
-            print("Aborting: no further block attempts will be made.")
+            _emit(
+                "Aborting: no further block attempts will be made.",
+                quiet=is_quiet,
+                force=True,
+            )
             break
 
         if outcome is BlockOutcome.BLOCKED:
             blocked_dids.add(did)
             summary.blocked += 1
-            print(f"BLOCK {handle} ({did})")
+            _emit(f"BLOCK {handle} ({did})", quiet=is_quiet)
+            _print_progress(
+                completed=summary.blocked,
+                total=summary.discovered,
+                retries=summary.retries,
+                skipped_invalid=summary.skipped_invalid,
+                is_quiet=is_quiet,
+                dry_run=False,
+            )
             if delay > ZERO_DURATION:
                 time.sleep(delay.total_seconds())
 
     return BlockResult(
-        summary=summary, failures=failures, skipped=skipped, cap_reached=cap_reached
+        summary=summary,
+        failures=failures,
+        skipped=skipped,
+        cap_reached=cap_reached,
     )
 
 
@@ -1587,6 +1935,7 @@ def print_summary(result: BlockResult, dry_run: bool) -> None:
 
     print(f"Failures: {summary.failed}")
     print(f"Retries used: {summary.retries}")
+    print(f"Re-authentications: {summary.reauths}")
 
     if result.cap_reached:
         print(
@@ -1612,6 +1961,8 @@ def main() -> None:
     Exit codes:
         0 — every member processed without failures.
         1 — at least one block attempt failed.
+        2 — user aborted the destructive confirmation, or stdin was not a TTY
+            without ``--yes``.
         3 — the PDS block-list cap was reached and the run was aborted.
 
     Raises:
@@ -1620,8 +1971,12 @@ def main() -> None:
 
     args = parse_args()
 
+    handle = resolve_handle()
     app_password = resolve_app_password()
-    client, self_did = login(resolve_handle(), app_password)
+    client, self_did = login(handle, app_password)
+
+    summary = BlockSummary()
+    reauth = _make_reauth_fn(client, handle, app_password, summary)
 
     source_inputs: list[str]
     if args.input is not None:
@@ -1633,27 +1988,44 @@ def main() -> None:
     skipped_inputs: list[str] = []
     for s_input in source_inputs:
         try:
-            target = resolve_input_to_list_target(client, s_input)
-            print(f"Using {target.source_kind} {target.list_uri}")
-            pack_members = fetch_list_members(client, target.list_uri)
+            target = resolve_input_to_list_target(
+                client, s_input, reauth=reauth
+            )
+            print(f"INFO: Using {target.source_kind} {target.list_uri}")
+            pack_members = fetch_list_members(
+                client, target.list_uri, reauth=reauth
+            )
         except Exception as error:
-            if not is_bad_request_skip(error):
+            if not is_input_unrecoverable(error):
                 raise
             skipped_inputs.append(s_input)
-            print(f"SKIP input {s_input}: {describe_error(error)}")
+            print(f"WARN: input {s_input} skipped: {describe_error(error)}")
             continue
-        print(f"\t- Loaded {len(pack_members)} members from this input")
+        print(f"INFO:   Loaded {len(pack_members)} members from this input")
         merge_unique_members(merged, pack_members)
     users = list(merged.values())
     print(
-        f"Loaded {len(users)} unique members across {len(source_inputs)} input source(s)"
+        f"INFO: Loaded {len(users)} unique members across "
+        f"{len(source_inputs)} input source(s)"
     )
     if skipped_inputs:
         print(
-            f"Skipped {len(skipped_inputs)} input source(s) due to bad request errors"
+            f"INFO: Skipped {len(skipped_inputs)} input source(s) due to"
+            " bad request errors"
         )
 
-    blocked_dids = fetch_blocked_dids(client)
+    blocked_dids = fetch_blocked_dids(client, reauth=reauth)
+
+    if not args.dry_run and not args.yes:
+        to_block = sum(
+            1
+            for user in users
+            if user.did != self_did and user.did not in blocked_dids
+        )
+        if to_block > 0 and not confirm_destructive(to_block):
+            print("Aborted by user.", file=sys.stderr)
+            raise SystemExit(2)
+        print(f"INFO: confirmed, blocking {to_block} accounts")
 
     result = block_users(
         client,
@@ -1663,6 +2035,9 @@ def main() -> None:
         delay=args.delay,
         dry_run=args.dry_run,
         is_verbose=args.verbose,
+        is_quiet=args.quiet,
+        reauth=reauth,
+        summary=summary,
     )
     print_summary(result, args.dry_run)
 
