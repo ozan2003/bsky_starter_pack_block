@@ -43,6 +43,7 @@ select = [
     "D101",
     "D102",
     "D103",
+    "D400",
 ]
 ignore = [
     "E501",
@@ -52,6 +53,7 @@ ignore = [
     "D213",
     "ANN401",  # use Any in **kwargs
     "PLR0911",  # many early returns in retry state machines
+    "PLR0912",  # many branches in retry state machines
     "PLR0913",
     "PLR2004",
     "S101",
@@ -62,7 +64,6 @@ ignore = [
 project-includes = ["bsky.py"]
 project-excludes = [".venv"]
 python-version = "3.12"
-site-package-path = ["stubs"]
 preset = "strict"
 
 [tool.pyrefly.errors]
@@ -78,5 +79,5 @@ no-access = true
 redundant-cast = true
 unbound-name = true
 implicit-any-attribute = true
-untyped-import = true
-ignore-missing-imports = true
+untyped-import = "ignore"
+missing-import = "ignore"
