@@ -51,6 +51,7 @@ ignore = [
     "D203",
     "D213",
     "ANN401",  # use Any in **kwargs
+    "PLR0911",  # many early returns in retry state machines
     "PLR0913",
     "PLR2004",
     "S101",
@@ -78,3 +79,4 @@ redundant-cast = true
 unbound-name = true
 implicit-any-attribute = true
 untyped-import = true
+ignore-missing-imports = true

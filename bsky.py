@@ -52,15 +52,29 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from importlib import metadata as importlib_metadata
 from math import isinf, isnan
 from pathlib import Path
-from random import choice, uniform
-from typing import cast
+from random import uniform
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+# pyrefly: ignore [missing-import]
 from atproto import Client, models
+# pyrefly: ignore [missing-import]
+from atproto.exceptions import (
+    AtProtocolError,
+    BadRequestError,
+    NetworkError,
+    RequestException,
+)
+
+try:
+    __version__ = importlib_metadata.version("bsky-starter-pack-block")
+except importlib_metadata.PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 STARTER_PACK_COLLECTION = "app.bsky.graph.starterpack"
 LIST_COLLECTION = "app.bsky.graph.list"
@@ -83,8 +97,8 @@ BLOCKS_PAGE_SIZE = 100
 # Successful blocks are followed by ``time.sleep(delay)``, CLI default when ``--delay`` omitted.
 DEFAULT_DELAY = dt.timedelta(seconds=0.5)
 
-# Retries after transient failures in ``block_users`` use capped exponential backoff + jitter.
-MAX_BLOCK_RETRIES = 4  # Highest ``attempt`` index allowed before giving up (matches ``while attempt <= ...``).
+# Attempts per account in ``block_users`` use capped exponential backoff + jitter.
+MAX_BLOCK_ATTEMPTS = 5  # Total attempts (initial + retries) per account.
 # Wait ``min(MAX, BASE * 2**(attempt - 1))`` seconds before each retry.
 BASE_BACKOFF = dt.timedelta(seconds=1.0)
 # Upper bound so backoff does not grow past a lot.
@@ -104,24 +118,25 @@ HTTP_STATUS_SERVER_ERROR_MIN = 500
 RATE_LIMIT_BUFFER = dt.timedelta(seconds=2.0)
 # If the server asks to wait longer than this, abort instead of blocking the terminal.
 RATE_LIMIT_MAX_WAIT = dt.timedelta(hours=3)
-# User agent is initialized once at invocation.
-USER_AGENT = choice(
-    (
-        "Mozilla/5.0 (Windows NT 6.2) AppleWebKit/531.2 (KHTML, like Gecko) Chrome/35.0.862.0 Safari/531.2",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_1 rv:5.0; ja-JP) AppleWebKit/535.6.1 (KHTML, like Gecko) Version/5.0.3 Safari/535.6.1",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/535.1 (KHTML, like Gecko) Chrome/32.0.816.0 Safari/535.1",
-        "Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_11_7) AppleWebKit/533.2 (KHTML, like Gecko) Chrome/58.0.898.0 Safari/533.2",
-        "Mozilla/5.0 (compatible; MSIE 7.0; Windows NT 5.2; Trident/5.0)",
-        "Opera/9.24.(Windows NT 6.2; sa-IN) Presto/2.9.172 Version/10.00",
-        "Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_6; rv:1.9.4.20) Gecko/6174-02-20 01:19:12.425873 Firefox/7.0",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:1.9.7.20) Gecko/8960-12-16 18:15:36.475525 Firefox/3.8",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_8_5 rv:6.0; kl-GL) AppleWebKit/532.19.4 (KHTML, like Gecko) Version/5.0.1 Safari/532.19.4",
-        "Mozilla/5.0 (Linux; Android 2.3.5) AppleWebKit/534.1 (KHTML, like Gecko) Chrome/56.0.885.0 Safari/534.1",
-    )
-)
+# XRPC error code returned by the PDS when the user has hit the maximum
+# per-account block list size. Used to abort the run with a clear message
+# instead of retrying forever.
+BLOCK_LIST_CAP_ERROR_CODE = "BlockedAccountCountLimitExceeded"
+# User agent sent when resolving short links. Identifies the script by name
+# and version so the short-link service can apply appropriate rate limits.
+USER_AGENT = f"bsky-starter-pack-block/{__version__}"
 
 # Useful for comparisons.
 ZERO_DURATION = dt.timedelta(0)
+
+
+class BlockListCapError(Exception):
+    """Raised when the PDS rejects a block because the user hit the per-account cap."""
+
+    def __init__(self, did: str, handle: str) -> None:
+        super().__init__(f"Block list cap reached while blocking {handle} ({did})")
+        self.did = did
+        self.handle = handle
 
 
 @dataclass(slots=True)
@@ -147,6 +162,8 @@ class BlockSummary:
             account.
         skipped_already_blocked: Number of members skipped because a block
             already exists.
+        skipped_invalid: Number of members skipped because the block request
+            returned a permanent client error (e.g. deleted account).
         would_block: Number of members that would be blocked in dry-run mode.
         blocked: Number of block records created successfully.
         failed: Number of members that could not be blocked.
@@ -156,6 +173,7 @@ class BlockSummary:
     discovered: int = 0
     skipped_self: int = 0
     skipped_already_blocked: int = 0
+    skipped_invalid: int = 0
     would_block: int = 0
     blocked: int = 0
     failed: int = 0
@@ -196,6 +214,14 @@ class SourceKind(StrEnum):
 
     STARTER_PACK = "starter_pack"
     LIST = "list"
+
+
+class BlockOutcome(StrEnum):
+    """Outcome of a single-account block attempt."""
+
+    BLOCKED = "blocked"
+    SKIPPED_INVALID = "skipped_invalid"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -919,37 +945,37 @@ def current_time_iso(client: Client) -> str:
     return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
-def create_block_record(client: Client, did: str) -> None:
+def create_block_record(
+    client: Client, did: str
+) -> models.AppBskyGraphBlock.CreateRecordResponse:
     """Create a Bluesky block record for one account.
+
+    The atproto SDK does not currently expose a high-level ``Client.block``
+    helper, so the underlying ``com.atproto.repo.createRecord`` procedure is
+    invoked directly with the ``app.bsky.graph.block`` collection.
 
     Args:
         client: Authenticated AT Protocol client.
         did: DID of the account to block.
 
-    Raises:
-        RuntimeError: If the client does not expose the signed-in repo DID when
-            the low-level block fallback is needed.
-    """
+    Returns:
+        The create-record response with the new record's ``uri`` and ``cid``.
 
-    block_method = getattr(client, "block", None)
-    if callable(block_method):
-        block_method(did)
-        return
+    Raises:
+        RuntimeError: If the signed-in repo DID cannot be determined.
+        AtProtocolError: If the PDS rejects the block (e.g. block-list cap).
+    """
 
     repo_did = getattr(getattr(client, "me", None), "did", None)
     if not isinstance(repo_did, str) or not repo_did:
         msg = "Unable to determine repo DID for block operation"
         raise RuntimeError(msg)
 
-    record_data: dict[str, str] = {
-        "subject": did,
-        "created_at": current_time_iso(client),
-    }
-    record = models.AppBskyGraphBlock.Record.model_validate(record_data)
-    client.app.bsky.graph.block.create(
-        repo_did,
-        record,
+    record = models.AppBskyGraphBlock.Record(
+        subject=did,
+        created_at=current_time_iso(client),
     )
+    return client.app.bsky.graph.block.create(repo_did, record)
 
 
 def extract_status_code(error: Exception) -> int | None:
@@ -972,8 +998,13 @@ def extract_status_code(error: Exception) -> int | None:
     return None
 
 
-def extract_response_headers(error: Exception) -> dict[str, str]:
+def extract_response_headers(error: Exception) -> dict[str, Any]:
     """Extract response headers from an SDK exception.
+
+    The atproto SDK normalizes response headers to a lowercase-keyed
+    ``dict[str, str]`` (see ``atproto_client.request._convert_headers_to_dict``),
+    but the public type is ``dict[str, Any]``; this function preserves that type
+    so callers do not have to cast.
 
     Args:
         error: Exception raised by the AT Protocol client or network layer.
@@ -988,7 +1019,7 @@ def extract_response_headers(error: Exception) -> dict[str, str]:
 
     headers = getattr(response, "headers", None)
     if isinstance(headers, dict):
-        return cast(dict[str, str], headers)
+        return headers
     return {}
 
 
@@ -1059,32 +1090,85 @@ def describe_error(error: Exception) -> str:
     return f"HTTP {status_code}: {error}"
 
 
-def is_transient_error(error: Exception) -> bool:
+def is_transient_error(error: BaseException) -> bool:
     """Decide whether a block failure should be retried.
+
+    Uses SDK exception classes and the HTTP status code instead of fragile
+    string matching. A failure is considered transient when:
+
+    - it is a ``NetworkError`` (this includes ``InvokeTimeoutError``);
+    - or it is a ``RequestException`` with a retryable status code (429, 5xx).
+
+    All other exceptions (``BadRequestError``, ``UnauthorizedError``, unknown
+    errors) are treated as permanent.
 
     Args:
         error: Exception raised during a block operation.
 
     Returns:
-        ``True`` for network errors, timeouts, rate limits, and server errors;
-        otherwise ``False``.
+        ``True`` for transient failures; ``False`` otherwise.
     """
 
-    error_name = type(error).__name__
-    if error_name in {"NetworkError", "InvokeTimeoutError"}:
+    if isinstance(error, NetworkError):
         return True
 
-    status_code = extract_status_code(error)
-    if status_code == HTTP_STATUS_TOO_MANY_REQUESTS:
-        return True
-    if (
-        isinstance(status_code, int)
-        and status_code >= HTTP_STATUS_SERVER_ERROR_MIN
-    ):
+    if isinstance(error, RequestException):
+        status_code = extract_status_code(error)
+        if status_code == HTTP_STATUS_TOO_MANY_REQUESTS:
+            return True
+        if (
+            isinstance(status_code, int)
+            and status_code >= HTTP_STATUS_SERVER_ERROR_MIN
+        ):
+            return True
+
+    return False
+
+
+def is_block_list_cap_error(error: BaseException) -> bool:
+    """Return ``True`` if ``error`` indicates the per-account block list cap.
+
+    Checks the XRPC error code on the response payload first, then falls back
+    to a substring match on the error message for SDK or server versions that
+    do not surface the structured error.
+
+    Args:
+        error: Exception raised by the AT Protocol client or network layer.
+
+    Returns:
+        ``True`` when the error is the block-list-cap error, otherwise ``False``.
+    """
+
+    response = getattr(error, "response", None)
+    content = getattr(response, "content", None) if response is not None else None
+
+    error_code: str | None = None
+    if isinstance(content, dict):
+        code = content.get("error")
+        if isinstance(code, str):
+            error_code = code
+    elif content is not None:
+        code = getattr(content, "error", None)
+        if isinstance(code, str):
+            error_code = code
+
+    if error_code == BLOCK_LIST_CAP_ERROR_CODE:
         return True
 
-    text = str(error).lower()
-    return "rate limit" in text or "temporarily unavailable" in text
+    message: str | None = None
+    if isinstance(content, dict):
+        msg = content.get("message")
+        if isinstance(msg, str):
+            message = msg
+    elif content is not None:
+        msg = getattr(content, "message", None)
+        if isinstance(msg, str):
+            message = msg
+    if message is None:
+        message = str(error)
+
+    lowered = message.lower()
+    return "block" in lowered and ("limit" in lowered or "exceeded" in lowered)
 
 
 def is_bad_request_skip(error: Exception) -> bool:
@@ -1122,7 +1206,7 @@ def call_with_rate_limit_retry[T](fn: Callable[[], T], *, context: str) -> T:
 
     Raises:
         RuntimeError: If the rate-limit wait exceeds
-            ``RATE_LIMIT_MAX_WAIT_SECONDS``.
+            ``RATE_LIMIT_MAX_WAIT``.
     """
 
     while True:
@@ -1162,10 +1246,16 @@ class BlockResult:
     Attributes:
         summary: Summary of the blocking operations.
         failures: Human-readable failure entries.
+        skipped: Human-readable entries for accounts skipped due to permanent
+            client errors.
+        cap_reached: ``True`` when the PDS-reported block-list cap was hit and
+            the run was aborted.
     """
 
     summary: BlockSummary
     failures: list[str]
+    skipped: list[str]
+    cap_reached: bool
 
 
 def _record_block_failure(
@@ -1270,7 +1360,7 @@ def _pause_before_block_retry(
     wait = backoff + dt.timedelta(seconds=jitter_seconds)
     print(
         f"WARN transient error for {user.handle} ({user.did}); retry "
-        + f"{attempt}/{MAX_BLOCK_RETRIES} in {wait.total_seconds():.2f}s"
+        + f"{attempt}/{MAX_BLOCK_ATTEMPTS} in {wait.total_seconds():.2f}s"
     )
     time.sleep(wait.total_seconds())
 
@@ -1281,29 +1371,52 @@ def _block_user_with_retries(
     user: Member,
     summary: BlockSummary,
     failures: list[str],
+    skipped: list[str],
     is_verbose: bool,
-) -> bool:
+) -> BlockOutcome:
     """Block one user, retrying transient failures.
+
+    Outcomes:
+
+    - ``BlockOutcome.BLOCKED`` — record created and a non-empty ``cid`` returned.
+    - ``BlockOutcome.SKIPPED_INVALID`` — the PDS returned a permanent
+      ``BadRequestError`` (e.g. deleted account, malformed DID). The retry
+      budget is not spent on these.
+    - ``BlockOutcome.FAILED`` — the retry budget was exhausted on transient
+      errors, or a non-transient ``RequestException`` was raised.
+    - Raises :class:`BlockListCapError` when the PDS reports the per-account
+      block list cap. ``block_users`` catches this to abort the entire run.
 
     Args:
         client: Authenticated AT Protocol client.
         user: Starter pack member to block.
-        summary: Mutable run summary updated with retries and failures.
+        summary: Mutable run summary updated with retries, skips, and failures.
         failures: Mutable list receiving failed account entries.
-        is_verbose: When ``True``, include detailed error text in failure
-            output.
+        skipped: Mutable list receiving skipped-invalid account entries.
+        is_verbose: When ``True``, include detailed error text in output.
 
     Returns:
-        ``True`` when the block record was created, otherwise ``False``.
+        The outcome of the block attempt.
     """
 
     attempt = 0
-    while attempt <= MAX_BLOCK_RETRIES:
+    while attempt < MAX_BLOCK_ATTEMPTS:
         try:
-            create_block_record(client, user.did)
-            return True
-        except Exception as error:  # noqa: BLE001
-            if not is_transient_error(error) or attempt == MAX_BLOCK_RETRIES:
+            response = create_block_record(client, user.did)
+        except BadRequestError as error:
+            if is_block_list_cap_error(error):
+                raise BlockListCapError(user.did, user.handle) from error
+            summary.skipped_invalid += 1
+            skipped.append(f"{user.handle} ({user.did})")
+            if is_verbose:
+                print(
+                    f"SKIP invalid {user.handle} ({user.did}) -> {describe_error(error)}"
+                )
+            else:
+                print(f"SKIP invalid {user.handle} ({user.did})")
+            return BlockOutcome.SKIPPED_INVALID
+        except AtProtocolError as error:
+            if not is_transient_error(error):
                 _record_block_failure(
                     summary=summary,
                     failures=failures,
@@ -1311,7 +1424,17 @@ def _block_user_with_retries(
                     error=error,
                     is_verbose=is_verbose,
                 )
-                return False
+                return BlockOutcome.FAILED
+
+            if attempt + 1 >= MAX_BLOCK_ATTEMPTS:
+                _record_block_failure(
+                    summary=summary,
+                    failures=failures,
+                    user=user,
+                    error=error,
+                    is_verbose=is_verbose,
+                )
+                return BlockOutcome.FAILED
 
             rate_limit_result = _pause_for_rate_limit_if_needed(
                 error=error,
@@ -1320,7 +1443,7 @@ def _block_user_with_retries(
                 failures=failures,
             )
             if rate_limit_result is False:
-                return False
+                return BlockOutcome.FAILED
             if rate_limit_result is True:
                 continue
 
@@ -1330,8 +1453,29 @@ def _block_user_with_retries(
                 user=user,
                 summary=summary,
             )
+            continue
+        except Exception as error:  # noqa: BLE001
+            _record_block_failure(
+                summary=summary,
+                failures=failures,
+                user=user,
+                error=error,
+                is_verbose=is_verbose,
+            )
+            return BlockOutcome.FAILED
 
-    return False
+        if not getattr(response, "cid", None):
+            _record_block_failure(
+                summary=summary,
+                failures=failures,
+                user=user,
+                error=RuntimeError("Block record created without a CID"),
+                is_verbose=is_verbose,
+            )
+            return BlockOutcome.FAILED
+        return BlockOutcome.BLOCKED
+
+    return BlockOutcome.FAILED
 
 
 def block_users(
@@ -1358,11 +1502,14 @@ def block_users(
         is_verbose: When ``True``, print verbose output.
 
     Returns:
-        A summary of the run and human-readable failure entries.
+        A summary of the run, human-readable failure and skipped entries, and
+        a flag indicating whether the block-list cap was reached.
     """
 
     summary = BlockSummary(discovered=len(users))
     failures: list[str] = []
+    skipped: list[str] = []
+    cap_reached = False
 
     for user in users:
         did = user.did
@@ -1384,21 +1531,35 @@ def block_users(
                 print(f"DRY BLOCK {handle} ({did})")
             continue
 
-        has_succeeded = _block_user_with_retries(
-            client=client,
-            user=user,
-            summary=summary,
-            failures=failures,
-            is_verbose=is_verbose,
-        )
-        if has_succeeded:
+        try:
+            outcome = _block_user_with_retries(
+                client=client,
+                user=user,
+                summary=summary,
+                failures=failures,
+                skipped=skipped,
+                is_verbose=is_verbose,
+            )
+        except BlockListCapError:
+            summary.failed += 1
+            failures.append(f"{user.handle} ({user.did})")
+            cap_reached = True
+            print(
+                f"ERROR block list cap reached while blocking {user.handle} ({user.did})"
+            )
+            print("Aborting: no further block attempts will be made.")
+            break
+
+        if outcome is BlockOutcome.BLOCKED:
             blocked_dids.add(did)
             summary.blocked += 1
             print(f"BLOCK {handle} ({did})")
             if delay > ZERO_DURATION:
                 time.sleep(delay.total_seconds())
 
-    return BlockResult(summary=summary, failures=failures)
+    return BlockResult(
+        summary=summary, failures=failures, skipped=skipped, cap_reached=cap_reached
+    )
 
 
 def print_summary(result: BlockResult, dry_run: bool) -> None:
@@ -1411,11 +1572,13 @@ def print_summary(result: BlockResult, dry_run: bool) -> None:
 
     summary = result.summary
     failures = result.failures
+    skipped = result.skipped
 
     print("\nSummary")
     print(f"Members discovered: {summary.discovered}")
     print(f"Skipped self: {summary.skipped_self}")
     print(f"Skipped already blocked: {summary.skipped_already_blocked}")
+    print(f"Skipped invalid: {summary.skipped_invalid}")
 
     if dry_run:
         print(f"Would block: {summary.would_block}")
@@ -1425,17 +1588,34 @@ def print_summary(result: BlockResult, dry_run: bool) -> None:
     print(f"Failures: {summary.failed}")
     print(f"Retries used: {summary.retries}")
 
+    if result.cap_reached:
+        print(
+            "\nBlock list cap reached: further block attempts were skipped."
+            " Bluesky limits the number of accounts a single account can block;"
+            " unblock some accounts to continue."
+        )
+
     if failures:
         print("\nFailed entries:")
         for failure in failures:
             print(f"- {failure}")
 
+    if skipped:
+        print("\nSkipped (invalid) entries:")
+        for entry in skipped:
+            print(f"- {entry}")
+
 
 def main() -> None:
     """Run the command-line workflow.
 
+    Exit codes:
+        0 — every member processed without failures.
+        1 — at least one block attempt failed.
+        3 — the PDS block-list cap was reached and the run was aborted.
+
     Raises:
-        SystemExit: If at least one block operation failed.
+        SystemExit: When the exit code is non-zero.
     """
 
     args = parse_args()
@@ -1486,6 +1666,8 @@ def main() -> None:
     )
     print_summary(result, args.dry_run)
 
+    if result.cap_reached:
+        raise SystemExit(3)
     if result.summary.failed > 0:
         raise SystemExit(1)
 
