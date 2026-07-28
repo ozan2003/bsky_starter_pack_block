@@ -5,7 +5,7 @@ Block every account contained in a Bluesky **starter pack** or **user list**.
 > [!CAUTION]
 > **Blocking is destructive.** This script can create **thousands** of blocks
 > in seconds. Bluesky does not offer bulk-unblock, so reversing a large run
-> means manually hunting down and unblocking accounts one by one — a tedious
+> means manually hunting down and unblocking accounts one by one - a tedious
 > and error-prone process.
 >
 > - **Soft blows matter too**: every block is a permanent sever. Starter packs
