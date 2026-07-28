@@ -2,6 +2,22 @@
 
 Block every account contained in a Bluesky **starter pack** or **user list**.
 
+> [!CAUTION]
+> **Blocking is destructive.** This script can create **thousands** of blocks
+> in seconds. Bluesky does not offer bulk-unblock, so reversing a large run
+> means manually hunting down and unblocking accounts one by one — a tedious
+> and error-prone process.
+>
+> - **Soft blows matter too**: every block is a permanent sever. Starter packs
+>   and lists are curated by humans and often include accounts you might
+>   actually want to see.
+> - **Abuse risk**: mass-blocking in bulk could be flagged as abusive behavior
+>   by Bluesky, potentially putting your account at risk. Use responsibly.
+> - **Before you block**: always **dry-run first** (`--dry-run --verbose`) and
+>   inspect the list. You can't easily undo this.
+>
+> Built-in `--unblock` or `--mute` support may be added in a future release.
+
 The script logs in with an app password, resolves each input (starter pack, list, or short link) into a list, loads members, merges them into a unique set (by DID), skips:
 
 - your own account
@@ -22,7 +38,7 @@ The project ships a `uv.lock`, so the recommended install is:
 uv sync
 ```
 
-If you don't use `uv`, any PEP 723-compatible tool works:
+Otherwise, install the dependency directly:
 
 ```bash
 python3 -m pip install "atproto>=0.0.65"
@@ -122,8 +138,8 @@ The script will pause and retry on rate limits and some transient network/server
 ## Notes
 
 - Bluesky caps the number of accounts a single account can block (currently a few thousand). The script detects this and aborts with exit code 3 so you don't loop forever. Unblock some accounts, then re-run.
-- Per-account output is suppressed by `--quiet`; operational messages (rate-limit pauses, re-authentication notices, cap-reached aborts) always print.
-- Progress is logged to stderr every 25 successful blocks (or would-blocks in dry-run), so the stdout stream stays parseable for `--quiet` users.
+- Per-account output is suppressed by `--quiet`. Operational messages (rate-limit pauses, re-authentication notices, cap-reached aborts) always print.
+- Progress is logged to stderr every 25 successful blocks (or would-blocks in dry-run). In `--quiet` mode both per-account output and progress are suppressed. Only operational messages and the final summary print.
 
 ## License
 
