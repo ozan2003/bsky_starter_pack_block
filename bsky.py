@@ -49,7 +49,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib import metadata as importlib_metadata
@@ -1791,7 +1791,7 @@ def _print_progress(
 def block_users(
     client: Client,
     *,
-    users: list[Member],
+    users: Sequence[Member],
     self_did: str,
     blocked_dids: set[str],
     delay: dt.timedelta,
