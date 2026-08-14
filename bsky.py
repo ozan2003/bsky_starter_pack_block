@@ -1,47 +1,27 @@
 #!/usr/bin/env python3
-"""Apply moderation actions to accounts in Bluesky starter packs or lists.
+"""Moderate accounts from Bluesky starter packs and lists.
 
-This script logs in to Bluesky with an app password, resolves each supported
-input to a list URI, loads every account across those lists (merging unique
-members by account), and applies a moderation action to the remaining
-accounts. Blocking is the default; ``--mute``, ``--unmute``, and
-``--unblock`` select the other supported actions.
+The module provides the command-line workflow for account moderation.
+It resolves source links, loads unique members, and applies one action.
 
-Supported inputs:
-    - ``at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>``
-    - ``at://<did-or-handle>/app.bsky.graph.list/<rkey>``
-    - ``http(s)://bsky.app/start/<did-or-handle>/<rkey>``
-    - ``http(s)://bsky.app/starter-pack/<did-or-handle>/<rkey>``
-    - ``http(s)://bsky.app/profile/<did-or-handle>/lists/<rkey>``
-    - ``http(s)://bsky.app/starter-pack-short/<code>``
-    - ``http(s)://go.bsky.app/<code>``
+The default action is ``block``. The other actions are ``mute``, ``unmute``,
+and ``unblock``.
 
-Usage:
-    First create an app password in Bluesky under Settings -> Privacy and
-    Security -> App Passwords. Then set that password and your handle in the environment:
+The module supports these source formats:
 
-    ```
-    export BSKY_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"
-    export BSKY_HANDLE="your.handle.bsky.social"
-    ```
+* List and starter-pack AT URIs.
+* Full ``bsky.app`` list and starter-pack URLs.
+* ``bsky.app`` and ``go.bsky.app`` short links.
 
-    Run a dry run before changing moderation state:
+The workflow uses ``BSKY_HANDLE`` and ``BSKY_APP_PASSWORD`` for login.
+The password must be an app password, not the account password.
 
-    ``python3 bsky.py --input <url-or-at-uri> --dry-run``
+Run a dry run before a write action::
 
-    Or load pack inputs from a file (one input per line):
+    uv run python bsky.py --input <url-or-at-uri> --dry-run --verbose
 
-    ``python3 bsky.py --file inputs.txt --dry-run``
-
-    ``--input`` and ``--file`` are mutually exclusive.
-
-    If the dry run looks correct, run without ``--dry-run``:
-
-    ``python3 bsky.py --input <url-or-at-uri>``
-
-    Use ``--mute``, ``--unmute``, or ``--unblock`` to select another action.
-
-    Use ``--delay`` to control the pause between moderation operations.
+Use ``--file`` instead of ``--input`` to load one source per line.
+The two input flags cannot be used together.
 """
 
 from __future__ import annotations
@@ -145,7 +125,12 @@ ZERO_DURATION = dt.timedelta(0)
 
 
 class BlockListCapError(Exception):
-    """Raised when the PDS rejects a block because the user hit the per-account cap."""
+    """Raised when the PDS reports the per-account block-list cap.
+
+    Args:
+        did: DID of the account that the workflow tried to block.
+        handle: Handle used in the human-readable error message.
+    """
 
     def __init__(self, did: str, handle: str) -> None:
         super().__init__(
@@ -245,7 +230,16 @@ class ModerationAction(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ModerationOptions:
-    """Immutable options shared by one moderation run."""
+    """Immutable options shared by one moderation run.
+
+    Attributes:
+        action: Moderation action applied to eligible members.
+        delay: Pause after each successful action.
+        dry_run: If ``True``, do not send write requests.
+        yes: If ``True``, skip the write confirmation prompt.
+        verbose: If ``True``, print detailed per-account output.
+        quiet: If ``True``, suppress normal per-account output.
+    """
 
     action: ModerationAction
     delay: dt.timedelta
@@ -268,6 +262,10 @@ def confirm_destructive(count: int, action: str = "block") -> bool:
 
     Returns ``True`` if the user typed ``y``/``yes`` (case-insensitive).
     Returns ``False`` for any other response.
+
+    Args:
+        count: Number of accounts that the action will affect.
+        action: Lowercase action name shown in the prompt.
 
     Raises:
         SystemExit: With code ``2`` if stdin is not a TTY (e.g. cron / CI),
@@ -328,15 +326,15 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line options.
 
     Returns:
-        Parsed command-line arguments for login, one or more starter-pack/list
-        inputs, throttling, and dry-run mode.
+        Parsed command-line arguments for login, source selection, action
+        selection, throttling, output, and dry-run mode.
     """
 
     parser = argparse.ArgumentParser(
         description="Apply moderation actions to users from Bluesky starter packs or lists",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
-            "Needed enviroment variables:\n"
+            "Needed environment variables:\n"
             "    - BSKY_APP_PASSWORD: Bluesky app password\n"
             "    - BSKY_HANDLE: Bluesky handle\n"
         ),
@@ -472,7 +470,14 @@ def load_inputs_from_file(path: str) -> list[str]:
 
 
 def resolve_handle() -> str:
-    """Resolve the Bluesky handle from the environment."""
+    """Read and return the Bluesky handle from the environment.
+
+    Returns:
+        The value of ``BSKY_HANDLE``.
+
+    Raises:
+        ValueError: If ``BSKY_HANDLE`` is missing or empty.
+    """
     handle = os.getenv("BSKY_HANDLE")
     if not handle:
         msg = "Missing Bluesky handle. Set BSKY_HANDLE."
@@ -609,6 +614,10 @@ def parse_list_path(path_source: str) -> PackReference | None:
     Returns:
         A list reference for ``/profile/.../lists/...`` paths, otherwise
         ``None``.
+
+    Raises:
+        ValueError: If the identifier or record key exceeds the segment
+            length limit.
     """
 
     parts = [part for part in path_source.split("/") if part]
@@ -950,11 +959,16 @@ def _make_reauth_fn(
         A zero-arg callable returning ``True`` if a re-authentication was
         performed (caller should retry) and ``False`` if a re-auth was
         already done earlier in this run.
+
+    Raises:
+        AtProtocolError: If the SDK rejects the re-authentication request.
     """
 
     reauth_used = [False]
 
     def reauth() -> bool:
+        """Re-authenticate once and report whether the caller can retry."""
+
         if reauth_used[0]:
             return False
         client.login(handle, app_password)
@@ -1063,6 +1077,10 @@ def fetch_list_members(
 
     Returns:
         Unique list members keyed by DID.
+
+    Raises:
+        AtProtocolError: If the PDS rejects a page request.
+        RuntimeError: If a rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT``.
     """
 
     members_by_did: dict[str, Member] = {}
@@ -1105,6 +1123,9 @@ def merge_unique_members(
     Args:
         merged: Mapping from account DID to member, updated in place.
         new_members: Members to insert when their DID is not already present.
+
+    Returns:
+        ``None``. The function updates ``merged`` in place.
     """
 
     for member in new_members:
@@ -1178,7 +1199,17 @@ def fetch_block_records(
 
 
 def block_record_key(uri: str) -> str:
-    """Extract and validate the record key from a block record URI."""
+    """Extract the record key from a block record URI.
+
+    Args:
+        uri: AT URI for an ``app.bsky.graph.block`` record.
+
+    Returns:
+        The record key at the end of ``uri``.
+
+    Raises:
+        ValueError: If ``uri`` does not have the expected AT URI shape.
+    """
 
     parts = uri.split("/")
     if (
@@ -1217,7 +1248,14 @@ def current_time_iso(client: Client) -> str:
 
 @dataclass(slots=True)
 class ModerationResult:
-    """Result of a moderation run."""
+    """Result of a moderation run.
+
+    Attributes:
+        summary: Counters collected during the run.
+        failures: Human-readable entries for failed actions.
+        skipped: Human-readable entries for invalid targets.
+        cap_reached: ``True`` if the block-list cap stopped the run.
+    """
 
     summary: ModerationSummary
     failures: list[str]
@@ -1235,7 +1273,21 @@ def _record_action_failure(
     is_verbose: bool,
     is_quiet: bool,
 ) -> None:
-    """Record and print a failed moderation request."""
+    """Record and print one failed moderation request.
+
+    Args:
+        action: Action that failed.
+        summary: Mutable counters for the current run.
+        failures: List that receives the failed account entry.
+        user: Account that received the failed request.
+        error: Exception raised by the SDK or the transport layer.
+        is_verbose: If ``True``, append the error text to the output.
+        is_quiet: If ``True``, suppress normal output. Failure output remains
+            visible because it is an operational message.
+
+    Returns:
+        ``None``. The function updates ``summary`` and ``failures`` in place.
+    """
 
     summary.failed += 1
     failures.append(f"{action.value} {user.handle} ({user.did})")
@@ -1331,7 +1383,27 @@ def _apply_action_with_retries(
     is_quiet: bool,
     reauth: Callable[[], bool] | None,
 ) -> ActionOutcome:
-    """Apply one moderation action with the shared retry policy."""
+    """Apply one moderation action with the shared retry policy.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        action: Moderation action to apply.
+        user: Account that receives the action.
+        self_did: DID of the signed-in account.
+        block_record_uri: Existing block record URI for ``UNBLOCK``.
+        summary: Mutable counters for the current run.
+        failures: List that receives failed account entries.
+        skipped: List that receives invalid account entries.
+        is_verbose: If ``True``, include detailed errors.
+        is_quiet: If ``True``, suppress normal per-account output.
+        reauth: Optional callback for one session renewal.
+
+    Returns:
+        The result of the action request.
+
+    Raises:
+        BlockListCapError: If a block request reaches the account block cap.
+    """
 
     attempt = 0
     while attempt < MAX_ATTEMPTS:
@@ -1450,7 +1522,17 @@ def _count_action_targets(
     self_did: str,
     block_records: dict[str, str],
 ) -> int:
-    """Count users that can receive the selected action."""
+    """Count users that can receive the selected action.
+
+    Args:
+        action: Action that will run.
+        users: Candidate accounts from the source lists.
+        self_did: DID that must always be skipped.
+        block_records: Existing block records keyed by target DID.
+
+    Returns:
+        Number of accounts that can receive a write or a dry-run action.
+    """
 
     return sum(
         1
@@ -1492,6 +1574,22 @@ def apply_users(
 
     The loop handles self and existing-state skips, dry-run output, retries,
     progress, delays, and block-list-cap handling for every action.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        action: Action to apply to each eligible account.
+        users: Candidate accounts from all input sources.
+        self_did: DID that must always be skipped.
+        block_records: Existing block records keyed by target DID.
+        delay: Pause after each successful action.
+        dry_run: If ``True``, do not send write requests.
+        is_verbose: If ``True``, print planned accounts and error details.
+        is_quiet: If ``True``, suppress normal per-account output.
+        reauth: Optional callback for one session renewal.
+        summary: Mutable counters for the current run.
+
+    Returns:
+        A result with counters, failures, skipped entries, and cap status.
     """
 
     summary.discovered = len(users)
@@ -1986,6 +2084,14 @@ def _emit(msg: str, *, quiet: bool, force: bool = False) -> None:
     with ``force=True`` so they always print even in ``--quiet`` mode.
     Per-account lines (BLOCK / SKIP / DRY BLOCK) call with ``force=False``
     (the default) and are suppressed in ``--quiet`` mode.
+
+    Args:
+        msg: Text to print.
+        quiet: If ``True``, suppress non-operational messages.
+        force: If ``True``, print the message even when ``quiet`` is enabled.
+
+    Returns:
+        ``None``.
     """
 
     if not quiet or force:
@@ -2019,6 +2125,9 @@ def _print_progress(
         skipped_invalid: Current skipped-invalid count.
         is_quiet: When ``True``, do nothing.
         dry_run: When ``True``, label the counter as planned.
+
+    Returns:
+        ``None``.
     """
 
     if is_quiet or PROGRESS_EVERY <= 0 or total <= 0:
@@ -2036,7 +2145,17 @@ def _print_progress(
 
 
 def load_source_inputs(args: argparse.Namespace) -> list[str]:
-    """Load source inputs selected by the command-line arguments."""
+    """Load source inputs selected by the command-line arguments.
+
+    Args:
+        args: Parsed arguments with either ``input`` or ``file`` set.
+
+    Returns:
+        A list of source strings. File inputs contain one source per line.
+
+    Raises:
+        ValueError: If the selected source file cannot be read or is empty.
+    """
 
     if args.input is not None:
         return [args.input]
@@ -2049,7 +2168,22 @@ def load_members_from_sources(
     *,
     reauth: Callable[[], bool] | None = None,
 ) -> list[Member]:
-    """Resolve sources and return their unique members."""
+    """Resolve sources and return their unique members.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        source_inputs: Source URLs, AT URIs, or short links.
+        reauth: Optional callback for one session renewal.
+
+    Returns:
+        Unique members keyed by account DID. Invalid source records are
+        skipped and reported.
+
+    Raises:
+        AtProtocolError: If a source request fails for a reason that cannot
+            be recovered by the input skip rules.
+        RuntimeError: If source resolution exceeds a retry or wait limit.
+    """
 
     merged: dict[str, Member] = {}
     skipped_inputs: list[str] = []
@@ -2097,7 +2231,18 @@ def load_action_records(
     *,
     reauth: Callable[[], bool] | None = None,
 ) -> dict[str, str]:
-    """Load block records when the selected action needs them."""
+    """Load block records when the selected action needs them.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        action: Selected moderation action.
+        self_did: DID of the signed-in account.
+        reauth: Optional callback for one session renewal.
+
+    Returns:
+        A mapping from target DID to block record URI for block actions and
+        unblock actions. Other actions return an empty mapping.
+    """
 
     if action in {ModerationAction.BLOCK, ModerationAction.UNBLOCK}:
         return fetch_block_records(client, self_did, reauth=reauth)
@@ -2113,7 +2258,22 @@ def confirm_action(
     dry_run: bool,
     yes: bool,
 ) -> int:
-    """Confirm a write action and return its eligible target count."""
+    """Confirm a write action and return its eligible target count.
+
+    Args:
+        action: Action that will run.
+        users: Candidate accounts from the source lists.
+        self_did: DID that must always be skipped.
+        block_records: Existing block records keyed by target DID.
+        dry_run: If ``True``, skip confirmation because no write occurs.
+        yes: If ``True``, skip the interactive confirmation prompt.
+
+    Returns:
+        Number of accounts eligible for the selected action.
+
+    Raises:
+        SystemExit: With code 2 if the user declines or no TTY exists.
+    """
 
     target_count = _count_action_targets(
         action,
@@ -2142,7 +2302,20 @@ def execute_moderation(
     reauth: Callable[[], bool] | None,
     summary: ModerationSummary,
 ) -> ModerationResult:
-    """Run one moderation action and print its summary."""
+    """Run one moderation action and print its summary.
+
+    Args:
+        client: Authenticated AT Protocol client.
+        users: Candidate accounts from the source lists.
+        self_did: DID that must always be skipped.
+        block_records: Existing block records keyed by target DID.
+        options: Immutable options for the current run.
+        reauth: Optional callback for one session renewal.
+        summary: Mutable counters for the current run.
+
+    Returns:
+        The moderation result returned by ``apply_users``.
+    """
 
     result = apply_users(
         client,
@@ -2162,7 +2335,15 @@ def execute_moderation(
 
 
 def exit_code_for_result(result: ModerationResult) -> int:
-    """Return the process exit code for a moderation result."""
+    """Return the process exit code for a moderation result.
+
+    Args:
+        result: Completed moderation result.
+
+    Returns:
+        ``3`` for a block-list cap, ``1`` for other failures, or ``0`` for
+        a run without failures.
+    """
 
     if result.cap_reached:
         return 3
@@ -2176,7 +2357,16 @@ def print_summary(
     action: ModerationAction,
     dry_run: bool,
 ) -> None:
-    """Print one summary format for every moderation action."""
+    """Print one summary format for every moderation action.
+
+    Args:
+        result: Completed moderation result.
+        action: Action used for the run.
+        dry_run: If ``True``, print planned counts instead of applied counts.
+
+    Returns:
+        ``None``.
+    """
 
     summary = result.summary
     subject = "Members" if action is ModerationAction.BLOCK else "Accounts"
