@@ -54,10 +54,16 @@ These functions implement the alternate actions in `bsky.py`:
 
 | Function | Responsibility |
 | --- | --- |
+| `load_source_inputs()` | Selects one input or loads inputs from a file. |
+| `load_members_from_sources()` | Resolves sources and merges unique members by DID. |
 | `fetch_block_records()` | Reads all block records and maps each target DID to its record URI. |
+| `load_action_records()` | Loads block records only for block and unblock actions. |
+| `confirm_action()` | Counts eligible targets and handles the write confirmation. |
 | `_apply_action_once()` | Dispatches one block, mute, unmute, or unblock request. |
 | `_apply_action_with_retries()` | Handles authentication, rate limits, retries, and failures for one request. |
 | `apply_users()` | Processes skips, dry runs, progress, delays, and results for every action. |
+| `execute_moderation()` | Runs the action and prints its summary. |
+| `exit_code_for_result()` | Converts the result to the documented process exit code. |
 
 The shared executor uses the same retry and summary logic for every action.
 This keeps API dispatch separate from user processing and output.

@@ -185,7 +185,6 @@ class ModerationSummary:
         failed: Number of actions that failed.
         retries: Number of retry attempts used for transient failures.
         reauths: Number of re-authentications triggered by an expired session.
-        cap_reached: Whether the block-list cap stopped the run.
     """
 
     discovered: int = 0
@@ -197,7 +196,6 @@ class ModerationSummary:
     failed: int = 0
     retries: int = 0
     reauths: int = 0
-    cap_reached: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +241,18 @@ class ModerationAction(StrEnum):
     MUTE = "mute"
     UNMUTE = "unmute"
     UNBLOCK = "unblock"
+
+
+@dataclass(frozen=True, slots=True)
+class ModerationOptions:
+    """Immutable options shared by one moderation run."""
+
+    action: ModerationAction
+    delay: dt.timedelta
+    dry_run: bool
+    yes: bool
+    verbose: bool
+    quiet: bool
 
 
 class ActionOutcome(StrEnum):
@@ -1487,6 +1497,7 @@ def apply_users(
     summary.discovered = len(users)
     failures: list[str] = []
     skipped: list[str] = []
+    cap_reached = False
     eligible_count = _count_action_targets(
         action,
         users,
@@ -1550,7 +1561,7 @@ def apply_users(
             )
         except BlockListCapError:
             summary.failed += 1
-            summary.cap_reached = True
+            cap_reached = True
             failures.append(f"{action.value} {user.handle} ({user.did})")
             _emit(
                 f"ERROR block list cap reached while blocking {user.handle} "
@@ -1591,7 +1602,7 @@ def apply_users(
         summary=summary,
         failures=failures,
         skipped=skipped,
-        cap_reached=summary.cap_reached,
+        cap_reached=cap_reached,
     )
 
 
@@ -2024,6 +2035,142 @@ def _print_progress(
     sys.stderr.flush()
 
 
+def load_source_inputs(args: argparse.Namespace) -> list[str]:
+    """Load source inputs selected by the command-line arguments."""
+
+    if args.input is not None:
+        return [args.input]
+    return load_inputs_from_file(args.file)
+
+
+def load_members_from_sources(
+    client: Client,
+    source_inputs: Sequence[str],
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> list[Member]:
+    """Resolve sources and return their unique members."""
+
+    merged: dict[str, Member] = {}
+    skipped_inputs: list[str] = []
+    for source_input in source_inputs:
+        try:
+            target = resolve_input_to_list_target(
+                client,
+                source_input,
+                reauth=reauth,
+            )
+            print(f"INFO: Using {target.source_kind} {target.list_uri}")
+            pack_members = fetch_list_members(
+                client,
+                target.list_uri,
+                reauth=reauth,
+            )
+        except Exception as error:
+            if not is_input_unrecoverable(error):
+                raise
+            skipped_inputs.append(source_input)
+            print(
+                f"WARN: input {source_input} skipped: {describe_error(error)}"
+            )
+            continue
+        print(f"INFO:   Loaded {len(pack_members)} members from this input")
+        merge_unique_members(merged, pack_members)
+
+    users = list(merged.values())
+    print(
+        f"INFO: Loaded {len(users)} unique members across "
+        f"{len(source_inputs)} input source(s)"
+    )
+    if skipped_inputs:
+        print(
+            f"INFO: Skipped {len(skipped_inputs)} input source(s) due to"
+            " bad request errors"
+        )
+    return users
+
+
+def load_action_records(
+    client: Client,
+    action: ModerationAction,
+    self_did: str,
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> dict[str, str]:
+    """Load block records when the selected action needs them."""
+
+    if action in {ModerationAction.BLOCK, ModerationAction.UNBLOCK}:
+        return fetch_block_records(client, self_did, reauth=reauth)
+    return {}
+
+
+def confirm_action(
+    action: ModerationAction,
+    users: Sequence[Member],
+    self_did: str,
+    block_records: dict[str, str],
+    *,
+    dry_run: bool,
+    yes: bool,
+) -> int:
+    """Confirm a write action and return its eligible target count."""
+
+    target_count = _count_action_targets(
+        action,
+        users,
+        self_did,
+        block_records,
+    )
+    if not dry_run and not yes:
+        if target_count > 0 and not confirm_destructive(
+            target_count,
+            action.value,
+        ):
+            print("Aborted by user.", file=sys.stderr)
+            raise SystemExit(2)
+        print(f"INFO: confirmed, {action.value} {target_count} accounts")
+    return target_count
+
+
+def execute_moderation(
+    client: Client,
+    users: Sequence[Member],
+    self_did: str,
+    block_records: dict[str, str],
+    options: ModerationOptions,
+    *,
+    reauth: Callable[[], bool] | None,
+    summary: ModerationSummary,
+) -> ModerationResult:
+    """Run one moderation action and print its summary."""
+
+    result = apply_users(
+        client,
+        action=options.action,
+        users=users,
+        self_did=self_did,
+        block_records=block_records,
+        delay=options.delay,
+        dry_run=options.dry_run,
+        is_verbose=options.verbose,
+        is_quiet=options.quiet,
+        reauth=reauth,
+        summary=summary,
+    )
+    print_summary(result, options.action, options.dry_run)
+    return result
+
+
+def exit_code_for_result(result: ModerationResult) -> int:
+    """Return the process exit code for a moderation result."""
+
+    if result.cap_reached:
+        return 3
+    if result.summary.failed > 0:
+        return 1
+    return 0
+
+
 def print_summary(
     result: ModerationResult,
     action: ModerationAction,
@@ -2089,6 +2236,14 @@ def main() -> None:
     """
 
     args = parse_args()
+    options = ModerationOptions(
+        action=args.action,
+        delay=args.delay,
+        dry_run=args.dry_run,
+        yes=args.yes,
+        verbose=args.verbose,
+        quiet=args.quiet,
+    )
 
     handle = resolve_handle()
     app_password = resolve_app_password()
@@ -2097,81 +2252,38 @@ def main() -> None:
     summary = ModerationSummary()
     reauth = _make_reauth_fn(client, handle, app_password, summary)
 
-    source_inputs: list[str]
-    if args.input is not None:
-        source_inputs = [args.input]
-    else:
-        source_inputs = load_inputs_from_file(args.file)
-
-    merged: dict[str, Member] = {}
-    skipped_inputs: list[str] = []
-    for s_input in source_inputs:
-        try:
-            target = resolve_input_to_list_target(
-                client, s_input, reauth=reauth
-            )
-            print(f"INFO: Using {target.source_kind} {target.list_uri}")
-            pack_members = fetch_list_members(
-                client, target.list_uri, reauth=reauth
-            )
-        except Exception as error:
-            if not is_input_unrecoverable(error):
-                raise
-            skipped_inputs.append(s_input)
-            print(f"WARN: input {s_input} skipped: {describe_error(error)}")
-            continue
-        print(f"INFO:   Loaded {len(pack_members)} members from this input")
-        merge_unique_members(merged, pack_members)
-    users = list(merged.values())
-    print(
-        f"INFO: Loaded {len(users)} unique members across "
-        f"{len(source_inputs)} input source(s)"
+    source_inputs = load_source_inputs(args)
+    users = load_members_from_sources(
+        client,
+        source_inputs,
+        reauth=reauth,
     )
-    if skipped_inputs:
-        print(
-            f"INFO: Skipped {len(skipped_inputs)} input source(s) due to"
-            " bad request errors"
-        )
-
-    block_records = (
-        fetch_block_records(client, self_did, reauth=reauth)
-        if args.action in {ModerationAction.BLOCK, ModerationAction.UNBLOCK}
-        else {}
+    block_records = load_action_records(
+        client,
+        options.action,
+        self_did,
+        reauth=reauth,
     )
-    target_count = _count_action_targets(
-        args.action,
+    confirm_action(
+        options.action,
         users,
         self_did,
         block_records,
+        dry_run=options.dry_run,
+        yes=options.yes,
     )
-
-    if not args.dry_run and not args.yes:
-        if target_count > 0 and not confirm_destructive(
-            target_count, args.action.value
-        ):
-            print("Aborted by user.", file=sys.stderr)
-            raise SystemExit(2)
-        print(f"INFO: confirmed, {args.action.value} {target_count} accounts")
-
-    result = apply_users(
+    result = execute_moderation(
         client,
-        action=args.action,
-        users=users,
-        self_did=self_did,
-        block_records=block_records,
-        delay=args.delay,
-        dry_run=args.dry_run,
-        is_verbose=args.verbose,
-        is_quiet=args.quiet,
+        users,
+        self_did,
+        block_records,
+        options,
         reauth=reauth,
         summary=summary,
     )
-    print_summary(result, args.action, args.dry_run)
-
-    if result.cap_reached:
-        raise SystemExit(3)
-    if result.summary.failed > 0:
-        raise SystemExit(1)
+    exit_code = exit_code_for_result(result)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
