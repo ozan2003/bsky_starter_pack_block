@@ -32,7 +32,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib import metadata as importlib_metadata
@@ -1518,7 +1518,7 @@ def _apply_action_with_retries(
 
 def _count_action_targets(
     action: ModerationAction,
-    users: Sequence[Member],
+    users: Collection[Member],
     self_did: str,
     block_records: dict[str, str],
 ) -> int:
@@ -1560,7 +1560,7 @@ def apply_users(
     client: Client,
     *,
     action: ModerationAction,
-    users: Sequence[Member],
+    users: Collection[Member],
     self_did: str,
     block_records: dict[str, str],
     delay: dt.timedelta,
@@ -2164,7 +2164,7 @@ def load_source_inputs(args: argparse.Namespace) -> list[str]:
 
 def load_members_from_sources(
     client: Client,
-    source_inputs: Sequence[str],
+    source_inputs: Collection[str],
     *,
     reauth: Callable[[], bool] | None = None,
 ) -> list[Member]:
@@ -2251,7 +2251,7 @@ def load_action_records(
 
 def confirm_action(
     action: ModerationAction,
-    users: Sequence[Member],
+    users: Collection[Member],
     self_did: str,
     block_records: dict[str, str],
     *,
@@ -2294,7 +2294,7 @@ def confirm_action(
 
 def execute_moderation(
     client: Client,
-    users: Sequence[Member],
+    users: Collection[Member],
     self_did: str,
     block_records: dict[str, str],
     options: ModerationOptions,
