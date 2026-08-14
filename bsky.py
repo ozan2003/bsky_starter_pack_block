@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Block every account listed in one or more Bluesky starter packs or lists.
+"""Apply moderation actions to accounts in Bluesky starter packs or lists.
 
 This script logs in to Bluesky with an app password, resolves each supported
-input to a list URI, loads every account across those lists (merging
-unique members by account), skips your own account and accounts you already
-block, then creates block records for the remaining accounts.
+input to a list URI, loads every account across those lists (merging unique
+members by account), and applies a moderation action to the remaining
+accounts. Blocking is the default; ``--mute``, ``--unmute``, and
+``--unblock`` select the other supported actions.
 
 Supported inputs:
     - ``at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>``
@@ -24,7 +25,7 @@ Usage:
     export BSKY_HANDLE="your.handle.bsky.social"
     ```
 
-    Run a dry run before blocking:
+    Run a dry run before changing moderation state:
 
     ``python3 bsky.py --input <url-or-at-uri> --dry-run``
 
@@ -38,7 +39,9 @@ Usage:
 
     ``python3 bsky.py --input <url-or-at-uri>``
 
-    You can pass ``--delay`` to control the pause between block operations.
+    Use ``--mute``, ``--unmute``, or ``--unblock`` to select another action.
+
+    Use ``--delay`` to control the pause between moderation operations.
 """
 
 from __future__ import annotations
@@ -77,6 +80,7 @@ except importlib_metadata.PackageNotFoundError:
 
 STARTER_PACK_COLLECTION = "app.bsky.graph.starterpack"
 LIST_COLLECTION = "app.bsky.graph.list"
+BLOCK_COLLECTION = "app.bsky.graph.block"
 SUPPORTED_STARTER_PACK_PATHS = {"start", "starter-pack"}
 PROFILE_PATH_SEGMENT = "profile"
 LISTS_PATH_SEGMENT = "lists"
@@ -108,8 +112,8 @@ BLOCKS_PAGE_SIZE = 100
 # Successful blocks are followed by ``time.sleep(delay)``, CLI default when ``--delay`` omitted.
 DEFAULT_DELAY = dt.timedelta(seconds=0.5)
 
-# Attempts per account in ``block_users`` use capped exponential backoff + jitter.
-MAX_BLOCK_ATTEMPTS = 5  # Total attempts (initial + retries) per account.
+# Attempts per account use capped exponential backoff and jitter.
+MAX_ATTEMPTS = 5  # Total attempts (initial + retries) per account.
 # Wait ``min(MAX, BASE * 2**(attempt - 1))`` seconds before each retry.
 BASE_BACKOFF = dt.timedelta(seconds=1.0)
 # Upper bound so backoff does not grow past a lot.
@@ -118,8 +122,6 @@ MAX_BACKOFF = dt.timedelta(seconds=8.0)
 # Uniform random extra delay on each backoff (seconds), reduces synchronized retries.
 JITTER = (dt.timedelta(seconds=0.0), dt.timedelta(seconds=0.6))
 
-# Error for non-existent packs or invalid DIDs.
-HTTP_STATUS_BAD_REQUEST = 400
 # HTTP response codes treated as retryable alongside network errors (see ``is_transient_error``).
 HTTP_STATUS_TOO_MANY_REQUESTS = 429
 # Any status greater than or equal to this is treated as a transient server error.
@@ -182,6 +184,9 @@ class BlockSummary:
         failed: Number of members that could not be blocked.
         retries: Number of retry attempts used for transient block failures.
         reauths: Number of re-authentications triggered by an expired session.
+        skipped_not_blocked: Number of unblock targets without a block record.
+        would_apply: Number of non-block actions planned in dry-run mode.
+        applied: Number of non-block actions completed successfully.
     """
 
     discovered: int = 0
@@ -193,6 +198,9 @@ class BlockSummary:
     failed: int = 0
     retries: int = 0
     reauths: int = 0
+    skipped_not_blocked: int = 0
+    would_apply: int = 0
+    applied: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,8 +247,25 @@ class BlockOutcome(StrEnum):
     FAILED = "failed"
 
 
-def confirm_destructive(count: int) -> bool:
-    """Prompt the user before blocking ``count`` accounts.
+class ModerationAction(StrEnum):
+    """Moderation action applied to each selected account."""
+
+    BLOCK = "block"
+    MUTE = "mute"
+    UNMUTE = "unmute"
+    UNBLOCK = "unblock"
+
+
+class ModerationOutcome(StrEnum):
+    """Outcome of one non-block moderation request."""
+
+    APPLIED = "applied"
+    SKIPPED_INVALID = "skipped_invalid"
+    FAILED = "failed"
+
+
+def confirm_destructive(count: int, action: str = "block") -> bool:
+    """Prompt the user before applying an action to ``count`` accounts.
 
     Returns ``True`` if the user typed ``y``/``yes`` (case-insensitive).
     Returns ``False`` for any other response.
@@ -252,13 +277,13 @@ def confirm_destructive(count: int) -> bool:
 
     if not sys.stdin.isatty():
         print(
-            f"ERROR: refusing to block {count} accounts without a TTY."
+            f"ERROR: refusing to {action} {count} accounts without a TTY."
             " Pass --yes to confirm non-interactively.",
             file=sys.stderr,
         )
         raise SystemExit(2)
 
-    print(f"About to block {count} accounts. Continue? [y/N]")
+    print(f"About to {action} {count} accounts. Continue? [y/N]")
     response = input().strip().lower()
     return response in {"y", "yes"}
 
@@ -309,7 +334,7 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(
-        description="Block all users from one or more Bluesky starter packs or lists",
+        description="Apply moderation actions to users from Bluesky starter packs or lists",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "Needed enviroment variables:\n"
@@ -331,21 +356,45 @@ def parse_args() -> argparse.Namespace:
         "-f",
         "--file",
         type=str,
-        help="Path to a UTF-8 text file with one starter-pack/list URL or AT URI per line",
+        help="Path to a UTF-8 text file with one input per line",
     )
+
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
+        "--mute",
+        dest="action",
+        action="store_const",
+        const=ModerationAction.MUTE,
+        help="Mute each account selected by the input",
+    )
+    action_group.add_argument(
+        "--unmute",
+        dest="action",
+        action="store_const",
+        const=ModerationAction.UNMUTE,
+        help="Unmute each account selected by the input",
+    )
+    action_group.add_argument(
+        "--unblock",
+        dest="action",
+        action="store_const",
+        const=ModerationAction.UNBLOCK,
+        help="Unblock each selected account with an existing block record",
+    )
+    parser.set_defaults(action=ModerationAction.BLOCK)
 
     parser.add_argument(
         "--delay",
         type=parse_delay,
         default=DEFAULT_DELAY,
-        help="Delay between blocks (seconds)",
+        help="Delay between moderation operations (seconds)",
     )
 
     parser.add_argument(
         "--dry-run",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Print users without blocking (use --no-dry-run to actually block)",
+        help="Print users without changing moderation state (use --no-dry-run to apply)",
     )
 
     parser.add_argument(
@@ -353,7 +402,7 @@ def parse_args() -> argparse.Namespace:
         "--yes",
         action="store_true",
         default=False,
-        help="Skip the confirmation prompt before blocking",
+        help="Skip the confirmation prompt before changing moderation state",
     )
 
     parser.add_argument(
@@ -527,6 +576,10 @@ def parse_starter_pack_path(path_source: str) -> PackReference | None:
     Returns:
         A starter pack reference for ``/start/.../...`` or
         ``/starter-pack/.../...`` paths, otherwise ``None``.
+
+    Raises:
+        ValueError: If the identifier or record key exceeds the segment
+            length limit.
     """
 
     parts = [part for part in path_source.split("/") if part]
@@ -534,6 +587,13 @@ def parse_starter_pack_path(path_source: str) -> PackReference | None:
         return None
 
     _, identifier, rkey = parts
+    for label, value in (("identifier", identifier), ("rkey", rkey)):
+        if len(value) > MAX_AT_URI_SEGMENT_LENGTH:
+            msg = (
+                f"Starter pack path {label} is {len(value)} chars, exceeding "
+                f"the {MAX_AT_URI_SEGMENT_LENGTH}-char cap"
+            )
+            raise ValueError(msg)
     return PackReference(
         identifier=identifier,
         rkey=rkey,
@@ -587,6 +647,9 @@ def parse_short_pack_path(
     Returns:
         A short-link reference for ``go.bsky.app/<code>`` or
         ``bsky.app/starter-pack-short/<code>``, otherwise ``None``.
+
+    Raises:
+        ValueError: If the short-link code exceeds the segment length limit.
     """
 
     parts = [part for part in path_source.split("/") if part]
@@ -594,20 +657,24 @@ def parse_short_pack_path(
         return None
 
     if host == BSKY_SHORT_LINK_HOST and len(parts) == 1:
-        return ShortStarterPackLink(
-            url=f"https://{BSKY_SHORT_LINK_HOST}/{parts[0]}"
-        )
-
-    if (
+        code = parts[0]
+    elif (
         host in BSKY_APP_HOSTS
         and len(parts) == 2
         and parts[0] == STARTER_PACK_SHORT_PATH
     ):
-        return ShortStarterPackLink(
-            url=f"https://{BSKY_SHORT_LINK_HOST}/{parts[1]}"
-        )
+        code = parts[1]
+    else:
+        return None
 
-    return None
+    if len(code) > MAX_AT_URI_SEGMENT_LENGTH:
+        msg = (
+            f"Short link code is {len(code)} chars, exceeding the "
+            f"{MAX_AT_URI_SEGMENT_LENGTH}-char cap"
+        )
+        raise ValueError(msg)
+
+    return ShortStarterPackLink(url=f"https://{BSKY_SHORT_LINK_HOST}/{code}")
 
 
 def parse_pack_input(pack_input: str) -> PackInput:
@@ -824,18 +891,6 @@ def normalize_input_uri(
 
     msg = f"Short link resolution loop exceeded for {source_input}"
     raise RuntimeError(msg)
-
-
-def normalize_starter_pack_uri(client: Client, pack_input: str) -> str:
-    """Backward-compatible alias for ``normalize_input_uri``.
-
-    Returns a canonical AT URI string rather than a ``PackReference``.
-    """
-
-    reference = normalize_input_uri(client, pack_input)
-    return (
-        f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
-    )
 
 
 def login(handle: str, app_password: str) -> tuple[Client, str]:
@@ -1098,6 +1153,90 @@ def fetch_blocked_dids(
     return blocked_dids
 
 
+def fetch_block_records(
+    client: Client,
+    repo_did: str,
+    *,
+    reauth: Callable[[], bool] | None = None,
+) -> dict[str, str]:
+    """Load the signed-in account's block records, keyed by subject DID.
+
+    The Bluesky ``app.bsky.graph.getBlocks`` query returns profile views. It
+    does not return the repository record key required to remove a block.
+    This function uses the generated ``app.bsky.graph.block.list`` namespace
+    instead. The namespace lists the signed-in repository's
+    ``app.bsky.graph.block`` records and preserves each record URI.
+
+    The function reads every page until the response has no cursor. It does
+    not change the repository. If multiple records contain the same subject
+    DID, the later record replaces the earlier mapping entry.
+
+    Args:
+        client: Authenticated AT Protocol client.
+            The client must have an authenticated session.
+        repo_did: DID of the signed-in account's repository. The value is
+            passed to ``app.bsky.graph.block.list`` as the repository name.
+        reauth: Optional callback that refreshes an expired session once.
+            The callback returns ``True`` when the caller should retry the
+            failed request.
+
+    Returns:
+        A dictionary that maps each blocked account DID to its block record
+        URI. The URI has the form
+        ``at://<repo-did>/app.bsky.graph.block/<rkey>``.
+
+    Raises:
+        AtProtocolError: If the PDS rejects a page request or the session
+            cannot be refreshed.
+        RuntimeError: If a rate-limit response requires a wait longer than
+            ``RATE_LIMIT_MAX_WAIT``.
+    """
+
+    records_by_did: dict[str, str] = {}
+    cursor: str | None = None
+
+    while True:
+        response = call_with_rate_limit_retry(
+            lambda cursor=cursor: client.app.bsky.graph.block.list(
+                repo_did,
+                cursor=cursor,
+                limit=BLOCKS_PAGE_SIZE,
+            ),
+            context="fetch block records page",
+            reauth=reauth,
+        )
+        for uri, record in response.records.items():
+            did = getattr(record, "subject", None)
+            if isinstance(did, str) and did and isinstance(uri, str):
+                records_by_did[did] = uri
+
+        next_cursor = response.cursor
+        if next_cursor:
+            cursor = next_cursor
+            continue
+        break
+
+    return records_by_did
+
+
+def block_record_key(uri: str) -> str:
+    """Extract and validate the record key from a block record URI."""
+
+    parts = uri.split("/")
+    if (
+        len(parts) != 5
+        or parts[0] != "at:"
+        or parts[1] != ""
+        or not parts[2]
+        or parts[3] != BLOCK_COLLECTION
+        or not parts[4]
+    ):
+        msg = f"Invalid block record URI: {uri!r}"
+        raise ValueError(msg)
+
+    return parts[4]
+
+
 def current_time_iso(client: Client) -> str:
     """Return the timestamp format expected by Bluesky record creation.
 
@@ -1149,6 +1288,346 @@ def create_block_record(
         created_at=current_time_iso(client),
     )
     return client.app.bsky.graph.block.create(repo_did, record)
+
+
+@dataclass(slots=True)
+class ModerationResult:
+    """Result of a mute, unmute, or unblock run."""
+
+    summary: BlockSummary
+    failures: list[str]
+    skipped: list[str]
+
+
+def _record_action_failure(
+    *,
+    action: ModerationAction,
+    summary: BlockSummary,
+    failures: list[str],
+    user: Member,
+    error: Exception,
+    is_verbose: bool,
+    is_quiet: bool,
+) -> None:
+    """Record and print a failed non-block moderation request."""
+
+    summary.failed += 1
+    failures.append(f"{action.value} {user.handle} ({user.did})")
+    message = describe_error(error)
+    suffix = f" -> {message}" if is_verbose else ""
+    _emit(
+        f"ERROR {action.value} {user.handle} ({user.did}){suffix}",
+        quiet=is_quiet,
+        force=True,
+    )
+
+
+def _apply_actor_action_once(
+    client: Client,
+    *,
+    action: ModerationAction,
+    user: Member,
+    repo_did: str,
+    block_record_uri: str | None,
+) -> bool:
+    """Apply one non-block moderation request without retrying it.
+
+    This function is the API dispatch layer for the alternate moderation
+    modes. It calls the high-level SDK method for mute and unmute. It deletes
+    the repository block record for unblock because AT Protocol represents a
+    block as a record, not as a separate unblock procedure.
+
+    The caller supplies the record URI for an unblock request. This function
+    extracts the record key and passes the signed-in repository DID and key to
+    the generated block-record ``delete`` method.
+
+    Args:
+        client: Authenticated AT Protocol client used to send the request.
+        action: Action to apply. Supported values are ``MUTE``, ``UNMUTE``,
+            and ``UNBLOCK``. ``BLOCK`` is handled by ``block_users`` and is
+            rejected here.
+        user: Account that receives the moderation action. Its DID is passed
+            to the mute and unmute procedures.
+        repo_did: DID of the signed-in account's repository. It is used only
+            for an unblock request.
+        block_record_uri: URI of the target's existing block record. It is
+            required for unblock and ignored for mute and unmute.
+
+    Returns:
+        ``True`` when the SDK does not return an explicit ``False`` status.
+        The SDK normally returns a boolean for these procedures. ``None`` is
+        treated as success for compatible clients that return no body after a
+        successful request.
+
+    Raises:
+        ValueError: If ``action`` is ``BLOCK`` or another unsupported value,
+            or if ``block_record_uri`` is not a valid block record URI.
+        RuntimeError: If unblock is requested without a block record URI.
+        AtProtocolError: If the PDS rejects the request. The caller handles
+            retries and authentication recovery.
+    """
+
+    if action is ModerationAction.MUTE:
+        response = client.mute(user.did)
+    elif action is ModerationAction.UNMUTE:
+        response = client.unmute(user.did)
+    elif action is ModerationAction.UNBLOCK:
+        if block_record_uri is None:
+            msg = f"No block record found for {user.did}"
+            raise RuntimeError(msg)
+        response = client.app.bsky.graph.block.delete(
+            repo_did,
+            block_record_key(block_record_uri),
+        )
+    else:
+        msg = f"Unsupported non-block action: {action.value}"
+        raise ValueError(msg)
+
+    # The SDK models these void procedures as bool. Treat an older or mocked
+    # client returning None as success when the request itself did not fail.
+    return response is not False
+
+
+def _apply_actor_action_with_retries(
+    *,
+    client: Client,
+    action: ModerationAction,
+    user: Member,
+    repo_did: str,
+    block_record_uri: str | None,
+    summary: BlockSummary,
+    failures: list[str],
+    skipped: list[str],
+    is_verbose: bool,
+    is_quiet: bool,
+    reauth: Callable[[], bool] | None,
+) -> ModerationOutcome:
+    """Apply one non-block action with the block workflow's retry policy."""
+
+    attempt = 0
+    while attempt < MAX_ATTEMPTS:
+        try:
+            applied = _apply_actor_action_once(
+                client,
+                action=action,
+                user=user,
+                repo_did=repo_did,
+                block_record_uri=block_record_uri,
+            )
+        except UnauthorizedError as error:
+            if reauth is not None and reauth():
+                continue
+            _record_action_failure(
+                action=action,
+                summary=summary,
+                failures=failures,
+                user=user,
+                error=error,
+                is_verbose=is_verbose,
+                is_quiet=is_quiet,
+            )
+            return ModerationOutcome.FAILED
+        except BadRequestError as error:
+            summary.skipped_invalid += 1
+            skipped.append(f"{action.value} {user.handle} ({user.did})")
+            detail = f" -> {describe_error(error)}" if is_verbose else ""
+            _emit(
+                f"SKIP invalid {action.value} {user.handle} ({user.did})"
+                f"{detail}",
+                quiet=is_quiet,
+            )
+            return ModerationOutcome.SKIPPED_INVALID
+        except AtProtocolError as error:
+            if not is_transient_error(error):
+                _record_action_failure(
+                    action=action,
+                    summary=summary,
+                    failures=failures,
+                    user=user,
+                    error=error,
+                    is_verbose=is_verbose,
+                    is_quiet=is_quiet,
+                )
+                return ModerationOutcome.FAILED
+
+            if attempt + 1 >= MAX_ATTEMPTS:
+                _record_action_failure(
+                    action=action,
+                    summary=summary,
+                    failures=failures,
+                    user=user,
+                    error=error,
+                    is_verbose=is_verbose,
+                    is_quiet=is_quiet,
+                )
+                return ModerationOutcome.FAILED
+
+            rate_limit_result = _pause_for_rate_limit_if_needed(
+                error=error,
+                user=user,
+                summary=summary,
+                failures=failures,
+                is_quiet=is_quiet,
+            )
+            if rate_limit_result is False:
+                return ModerationOutcome.FAILED
+            if rate_limit_result is True:
+                continue
+
+            attempt += 1
+            _pause_before_retry(
+                attempt=attempt,
+                user=user,
+                summary=summary,
+            )
+            continue
+        except Exception as error:  # noqa: BLE001
+            _record_action_failure(
+                action=action,
+                summary=summary,
+                failures=failures,
+                user=user,
+                error=error,
+                is_verbose=is_verbose,
+                is_quiet=is_quiet,
+            )
+            return ModerationOutcome.FAILED
+
+        if not applied:
+            _record_action_failure(
+                action=action,
+                summary=summary,
+                failures=failures,
+                user=user,
+                error=RuntimeError(
+                    f"{action.value} request returned an unsuccessful status"
+                ),
+                is_verbose=is_verbose,
+                is_quiet=is_quiet,
+            )
+            return ModerationOutcome.FAILED
+        return ModerationOutcome.APPLIED
+
+    return ModerationOutcome.FAILED
+
+
+def moderate_users(
+    client: Client,
+    *,
+    action: ModerationAction,
+    users: Sequence[Member],
+    self_did: str,
+    block_records: dict[str, str],
+    delay: dt.timedelta,
+    dry_run: bool,
+    is_verbose: bool,
+    is_quiet: bool = False,
+    reauth: Callable[[], bool] | None = None,
+    summary: BlockSummary,
+) -> ModerationResult:
+    """Apply mute, unmute, or unblock to each eligible account.
+
+    Unblock uses the account's existing ``app.bsky.graph.block`` record URI;
+    accounts without a matching record are skipped without making a write.
+    """
+
+    if action is ModerationAction.BLOCK:
+        msg = "moderate_users only handles non-block actions"
+        raise ValueError(msg)
+
+    summary.discovered = len(users)
+    failures: list[str] = []
+    skipped: list[str] = []
+
+    for user in users:
+        if user.did == self_did:
+            summary.skipped_self += 1
+            _emit(f"SKIP self {user.handle} ({user.did})", quiet=is_quiet)
+            continue
+
+        block_record_uri = block_records.get(user.did)
+        if action is ModerationAction.UNBLOCK and block_record_uri is None:
+            summary.skipped_not_blocked += 1
+            _emit(
+                f"SKIP not blocked {user.handle} ({user.did})",
+                quiet=is_quiet,
+            )
+            continue
+
+        if dry_run:
+            summary.would_apply += 1
+            if is_verbose:
+                _emit(
+                    f"DRY {action.value.upper()} {user.handle} ({user.did})",
+                    quiet=is_quiet,
+                )
+            continue
+
+        outcome = _apply_actor_action_with_retries(
+            client=client,
+            action=action,
+            user=user,
+            repo_did=self_did,
+            block_record_uri=block_record_uri,
+            summary=summary,
+            failures=failures,
+            skipped=skipped,
+            is_verbose=is_verbose,
+            is_quiet=is_quiet,
+            reauth=reauth,
+        )
+        if outcome is ModerationOutcome.APPLIED:
+            summary.applied += 1
+            _emit(
+                f"{action.value.upper()} {user.handle} ({user.did})",
+                quiet=is_quiet,
+            )
+            if delay > ZERO_DURATION:
+                time.sleep(delay.total_seconds())
+
+    return ModerationResult(
+        summary=summary,
+        failures=failures,
+        skipped=skipped,
+    )
+
+
+def print_moderation_summary(
+    result: ModerationResult,
+    action: ModerationAction,
+    dry_run: bool,
+) -> None:
+    """Print the summary for a non-block moderation action."""
+
+    summary = result.summary
+    print("\nSummary")
+    print(f"Accounts discovered: {summary.discovered}")
+    print(f"Skipped self: {summary.skipped_self}")
+    if action is ModerationAction.UNBLOCK:
+        print(f"Skipped not blocked: {summary.skipped_not_blocked}")
+    print(f"Skipped invalid: {summary.skipped_invalid}")
+    if dry_run:
+        print(f"Would {action.value}: {summary.would_apply}")
+    else:
+        verb = {
+            ModerationAction.MUTE: "Muted",
+            ModerationAction.UNMUTE: "Unmuted",
+            ModerationAction.UNBLOCK: "Unblocked",
+        }[action]
+        print(f"{verb} successfully: {summary.applied}")
+    print(f"Failures: {summary.failed}")
+    print(f"Retries used: {summary.retries}")
+    print(f"Re-authentications: {summary.reauths}")
+
+    if result.failures:
+        print("\nFailed entries:")
+        for failure in result.failures:
+            print(f"- {failure}")
+
+    if result.skipped:
+        print("\nSkipped (invalid) entries:")
+        for entry in result.skipped:
+            print(f"- {entry}")
 
 
 def extract_status_code(error: Exception) -> int | None:
@@ -1264,7 +1743,7 @@ def describe_error(error: Exception) -> str:
 
 
 def is_transient_error(error: BaseException) -> bool:
-    """Decide whether a block failure should be retried.
+    """Decide whether a moderation failure should be retried.
 
     Uses SDK exception classes and the HTTP status code instead of fragile
     string matching. A failure is considered transient when:
@@ -1344,27 +1823,6 @@ def is_block_list_cap_error(error: BaseException) -> bool:
 
     lowered = message.lower()
     return "block" in lowered and ("limit" in lowered or "exceeded" in lowered)
-
-
-def is_bad_request_skip(error: Exception) -> bool:
-    """Decide whether a 400 Bad Request should be silently skipped.
-
-    The AT Protocol API returns HTTP 400 for permanently invalid targets
-    (deleted accounts, malformed DIDs, etc.).  Retrying these is pointless,
-    and they should not count as actionable failures.
-
-    Args:
-        error: Exception raised during a block operation.
-
-    Returns:
-        ``True`` when the error is an HTTP 400 that indicates an invalid
-        or unreachable target.
-    """
-
-    return isinstance(error, BadRequestError) or (
-        isinstance(error, RequestException)
-        and extract_status_code(error) == HTTP_STATUS_BAD_REQUEST
-    )
 
 
 def is_input_unrecoverable(error: BaseException) -> bool:
@@ -1503,10 +1961,16 @@ def _record_block_failure(
     failures.append(f"{user.handle} ({user.did})")
     if is_verbose:
         _emit(
-            f"ERROR {user.handle} ({user.did}) -> {error_text}", quiet=is_quiet
+            f"ERROR {user.handle} ({user.did}) -> {error_text}",
+            quiet=is_quiet,
+            force=True,
         )
     else:
-        _emit(f"ERROR {user.handle} ({user.did})", quiet=is_quiet)
+        _emit(
+            f"ERROR {user.handle} ({user.did})",
+            quiet=is_quiet,
+            force=True,
+        )
 
 
 def _pause_for_rate_limit_if_needed(
@@ -1520,8 +1984,8 @@ def _pause_for_rate_limit_if_needed(
     """Pause for a rate-limit response when retry timing is available.
 
     Args:
-        error: Exception raised by the block operation.
-        user: Starter pack member being blocked.
+        error: Exception raised by the moderation operation.
+        user: Account receiving the moderation operation.
         summary: Mutable run summary updated with retry or failure counts.
         failures: Mutable list receiving a failed account entry when the
             rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT``.
@@ -1567,17 +2031,17 @@ def _pause_for_rate_limit_if_needed(
     return True
 
 
-def _pause_before_block_retry(
+def _pause_before_retry(
     *,
     attempt: int,
     user: Member,
     summary: BlockSummary,
 ) -> None:
-    """Sleep before retrying a transient block failure.
+    """Sleep before retrying a transient moderation failure.
 
     Args:
         attempt: One-based retry attempt number.
-        user: Starter pack member being blocked.
+        user: Account receiving the moderation action.
         summary: Mutable run summary updated with the retry count.
     """
 
@@ -1590,7 +2054,7 @@ def _pause_before_block_retry(
     wait = backoff + dt.timedelta(seconds=jitter_seconds)
     print(
         f"WARN transient error for {user.handle} ({user.did}); retry "
-        + f"{attempt}/{MAX_BLOCK_ATTEMPTS} in {wait.total_seconds():.2f}s"
+        + f"{attempt}/{MAX_ATTEMPTS} in {wait.total_seconds():.2f}s"
     )
     time.sleep(wait.total_seconds())
 
@@ -1634,7 +2098,7 @@ def _block_user_with_retries(
     """
 
     attempt = 0
-    while attempt < MAX_BLOCK_ATTEMPTS:
+    while attempt < MAX_ATTEMPTS:
         try:
             response = create_block_record(client, user.did)
         except UnauthorizedError as error:
@@ -1677,7 +2141,7 @@ def _block_user_with_retries(
                 )
                 return BlockOutcome.FAILED
 
-            if attempt + 1 >= MAX_BLOCK_ATTEMPTS:
+            if attempt + 1 >= MAX_ATTEMPTS:
                 _record_block_failure(
                     summary=summary,
                     failures=failures,
@@ -1701,7 +2165,7 @@ def _block_user_with_retries(
                 continue
 
             attempt += 1
-            _pause_before_block_retry(
+            _pause_before_retry(
                 attempt=attempt,
                 user=user,
                 summary=summary,
@@ -1827,6 +2291,11 @@ def block_users(
     failures: list[str] = []
     skipped: list[str] = []
     cap_reached = False
+    eligible_count = sum(
+        1
+        for user in users
+        if user.did != self_did and user.did not in blocked_dids
+    )
 
     for user in users:
         did = user.did
@@ -1848,11 +2317,7 @@ def block_users(
                 _emit(f"DRY BLOCK {handle} ({did})", quiet=is_quiet)
             _print_progress(
                 completed=summary.would_block,
-                total=sum(
-                    1
-                    for u in users
-                    if u.did != self_did and u.did not in blocked_dids
-                ),
+                total=eligible_count,
                 retries=summary.retries,
                 skipped_invalid=summary.skipped_invalid,
                 is_quiet=is_quiet,
@@ -1893,7 +2358,7 @@ def block_users(
             _emit(f"BLOCK {handle} ({did})", quiet=is_quiet)
             _print_progress(
                 completed=summary.blocked,
-                total=summary.discovered,
+                total=eligible_count,
                 retries=summary.retries,
                 skipped_invalid=summary.skipped_invalid,
                 is_quiet=is_quiet,
@@ -1951,8 +2416,102 @@ def print_summary(result: BlockResult, dry_run: bool) -> None:
 
     if skipped:
         print("\nSkipped (invalid) entries:")
-        for entry in skipped:
+        for entry in result.skipped:
             print(f"- {entry}")
+
+
+def _run_non_block_action(
+    client: Client,
+    *,
+    action: ModerationAction,
+    users: Sequence[Member],
+    self_did: str,
+    delay: dt.timedelta,
+    dry_run: bool,
+    yes: bool,
+    is_verbose: bool,
+    is_quiet: bool,
+    reauth: Callable[[], bool],
+    summary: BlockSummary,
+) -> ModerationResult:
+    """Prepare and execute a mute, unmute, or unblock workflow.
+
+    This helper keeps the alternate action path separate from the default
+    block workflow in ``main``. For unblock, it first loads repository block
+    records so that the later delete request has the required record key. For
+    mute and unmute, it uses an empty block-record mapping because those API
+    procedures accept an account DID directly.
+
+    The confirmation count excludes the signed-in account. For unblock, it
+    also excludes accounts that have no matching block record. When the run
+    is not a dry run and ``yes`` is false, this function asks for confirmation
+    before it sends any write request. It then delegates account processing to
+    ``moderate_users``.
+
+    Args:
+        client: Authenticated AT Protocol client used for record lookup and
+            moderation requests.
+        action: Non-block action to apply. Must be ``MUTE``, ``UNMUTE``, or
+            ``UNBLOCK``.
+        users: Accounts selected from the input lists or starter packs.
+        self_did: DID of the signed-in account. This account is never changed.
+        delay: Time to wait after each successful moderation request.
+        dry_run: If ``True``, count and print planned operations without
+            writing to the PDS.
+        yes: If ``True``, skip the interactive confirmation prompt.
+        is_verbose: If ``True``, include each planned account in dry-run
+            output and include detailed errors.
+        is_quiet: If ``True``, suppress normal per-account output.
+        reauth: Callback that re-authenticates an expired session. It is
+            passed to the paginated lookup and moderation workflow.
+        summary: Mutable run summary updated by this function and by
+            ``moderate_users``.
+
+    Returns:
+        A ``ModerationResult`` containing the updated summary, failed account
+        entries, and accounts skipped because the request was invalid.
+
+    Raises:
+        SystemExit: With code 2 if confirmation is required but the user
+            declines, or if the process has no TTY and ``yes`` is false.
+        AtProtocolError: If block-record lookup fails before moderation
+            starts and the retry handler cannot recover the request.
+        ValueError: If ``action`` is ``BLOCK`` or another unsupported value.
+    """
+
+    block_records = (
+        fetch_block_records(client, self_did, reauth=reauth)
+        if action is ModerationAction.UNBLOCK
+        else {}
+    )
+    if action is ModerationAction.UNBLOCK:
+        to_apply = sum(
+            1
+            for user in users
+            if user.did != self_did and user.did in block_records
+        )
+    else:
+        to_apply = sum(1 for user in users if user.did != self_did)
+
+    if not dry_run and not yes:
+        if to_apply > 0 and not confirm_destructive(to_apply, action.value):
+            print("Aborted by user.", file=sys.stderr)
+            raise SystemExit(2)
+        print(f"INFO: confirmed, {action.value} {to_apply} accounts")
+
+    return moderate_users(
+        client,
+        action=action,
+        users=users,
+        self_did=self_did,
+        block_records=block_records,
+        delay=delay,
+        dry_run=dry_run,
+        is_verbose=is_verbose,
+        is_quiet=is_quiet,
+        reauth=reauth,
+        summary=summary,
+    )
 
 
 def main() -> None:
@@ -1960,7 +2519,7 @@ def main() -> None:
 
     Exit codes:
         0 — every member processed without failures.
-        1 — at least one block attempt failed.
+        1 — at least one moderation operation failed.
         2 — user aborted the destructive confirmation, or stdin was not a TTY
             without ``--yes``.
         3 — the PDS block-list cap was reached and the run was aborted.
@@ -2013,6 +2572,29 @@ def main() -> None:
             f"INFO: Skipped {len(skipped_inputs)} input source(s) due to"
             " bad request errors"
         )
+
+    if args.action is not ModerationAction.BLOCK:
+        moderation_result = _run_non_block_action(
+            client,
+            action=args.action,
+            users=users,
+            self_did=self_did,
+            delay=args.delay,
+            dry_run=args.dry_run,
+            yes=args.yes,
+            is_verbose=args.verbose,
+            is_quiet=args.quiet,
+            reauth=reauth,
+            summary=summary,
+        )
+        print_moderation_summary(
+            moderation_result,
+            args.action,
+            args.dry_run,
+        )
+        if moderation_result.summary.failed > 0:
+            raise SystemExit(1)
+        return
 
     blocked_dids = fetch_blocked_dids(client, reauth=reauth)
 
