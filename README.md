@@ -3,18 +3,6 @@
 Apply a moderation action to every account contained in a Bluesky **starter
 pack** or **user list**.
 
-> [!CAUTION]
-> **Blocking changes account relationships.** A large run can create
-> **thousands** of blocks in seconds.
->
-> - A block stops the relationship between your account and the target.
-> - Bulk blocking can trigger abuse controls on your account.
-> - A block list has no bulk-unblock operation.
-> - Run `--dry-run --verbose` before every write action.
->
-> The default action is block. Use `--mute`, `--unmute`, or `--unblock` to
-> select another action.
-
 The script logs in with an app password. It resolves each input to a list and
 loads the list members. It merges members by DID and skips:
 
