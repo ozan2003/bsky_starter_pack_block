@@ -39,7 +39,7 @@ from importlib import metadata as importlib_metadata
 from math import isinf, isnan
 from pathlib import Path
 from random import uniform
-from typing import Any, cast
+from typing import Any, Never, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -914,11 +914,14 @@ def login(handle: str, app_password: str) -> tuple[Client, str]:
 
     Raises:
         RuntimeError: If login completes but the authenticated DID cannot be
-            determined.
+            determined, or a rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT``.
     """
 
     client = Client()
-    profile = client.login(handle, app_password)
+    profile = call_with_rate_limit_retry(
+        lambda: client.login(handle, app_password),
+        context="login",
+    )
 
     did = profile.did
     if not did:
@@ -1339,30 +1342,34 @@ def _apply_action_once(
             retries and authentication recovery.
     """
 
-    if action is ModerationAction.BLOCK:
-        response = client.app.bsky.graph.block.create(
-            self_did,
-            models.AppBskyGraphBlock.Record(
-                subject=user.did,
-                created_at=current_time_iso(client),
-            ),
-        )
-        return bool(getattr(response, "cid", None))
-    if action is ModerationAction.MUTE:
-        response = client.mute(user.did)
-    elif action is ModerationAction.UNMUTE:
-        response = client.unmute(user.did)
-    elif action is ModerationAction.UNBLOCK:
-        if block_record_uri is None:
-            msg = f"No block record found for {user.did}"
-            raise RuntimeError(msg)
-        response = client.app.bsky.graph.block.delete(
-            self_did,
-            block_record_key(block_record_uri),
-        )
-    else:
-        msg = f"Unsupported moderation action: {action.value}"
-        raise ValueError(msg)
+    response: bool
+    match action:
+        case ModerationAction.BLOCK:
+            record_response = client.app.bsky.graph.block.create(
+                self_did,
+                models.AppBskyGraphBlock.Record(
+                    subject=user.did,
+                    created_at=current_time_iso(client),
+                ),
+            )
+            response = bool(getattr(record_response, "cid", None))
+
+        case ModerationAction.MUTE:
+            response = client.mute(user.did)
+        case ModerationAction.UNMUTE:
+            response = client.unmute(user.did)
+        case ModerationAction.UNBLOCK:
+            if block_record_uri is None:
+                msg = f"No block record found for {user.did}"
+                raise RuntimeError(msg)
+            response = client.app.bsky.graph.block.delete(
+                self_did,
+                block_record_key(block_record_uri),
+            )
+        case _:
+            unreachable: Never = action
+            msg = f"Unsupported moderation action: {unreachable}"
+            raise ValueError(msg)
 
     # The SDK models these void procedures as bool. Treat an older or mocked
     # client returning None as success when the request itself did not fail.
@@ -1930,7 +1937,7 @@ def call_with_rate_limit_retry[T](
     context: str,
     reauth: Callable[[], bool] | None = None,
 ) -> T:
-    """Call ``fn`` and transparently pause on HTTP 429 rate limits.
+    """Call ``fn`` and pause on rate limits and transient errors.
 
     On a 429 response the function reads ``ratelimit-reset`` (or
     ``retry-after``) from the response headers, sleeps until the window
@@ -1938,6 +1945,11 @@ def call_with_rate_limit_retry[T](
     ``reauth`` callback is invoked; if it returns ``True`` (a re-auth just
     succeeded) the function is retried once, otherwise the exception
     propagates.
+
+    Transient failures (network errors, request timeouts, HTTP 5xx) are
+    retried with capped exponential backoff for up to ``MAX_ATTEMPTS`` total
+    attempts. This mirrors the write-path retry policy so a slow or flaky
+    network does not abort a read-only fetch.
 
     Args:
         fn: Zero-argument callable that performs a single API request.
@@ -1953,8 +1965,10 @@ def call_with_rate_limit_retry[T](
     Raises:
         RuntimeError: If the rate-limit wait exceeds
             ``RATE_LIMIT_MAX_WAIT``.
+        Exception: The last failure after transient retries are exhausted.
     """
 
+    attempt = 0
     while True:
         try:
             return fn()
@@ -1966,27 +1980,39 @@ def call_with_rate_limit_retry[T](
             ):
                 continue
             status_code = extract_status_code(error)
-            if status_code != HTTP_STATUS_TOO_MANY_REQUESTS:
-                raise
+            if status_code == HTTP_STATUS_TOO_MANY_REQUESTS:
+                wait = extract_rate_limit_wait(error)
+                if wait is None:
+                    raise
 
-            wait = extract_rate_limit_wait(error)
-            if wait is None:
-                raise
+                resume_at = dt.datetime.fromtimestamp(
+                    time.time() + wait.total_seconds(),
+                    tz=dt.UTC,
+                ).isoformat()
+                if wait > RATE_LIMIT_MAX_WAIT:
+                    msg = (
+                        f"Rate limit for {context} resets at {resume_at} "
+                        f"({wait.total_seconds():.0f}s), exceeds max wait of "
+                        f"{RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s"
+                    )
+                    raise RuntimeError(msg) from error
 
-            resume_at = dt.datetime.fromtimestamp(
-                time.time() + wait.total_seconds(),
-                tz=dt.UTC,
-            ).isoformat()
-            if wait > RATE_LIMIT_MAX_WAIT:
-                msg = (
-                    f"Rate limit for {context} resets at {resume_at} "
-                    f"({wait.total_seconds():.0f}s), exceeds max wait of "
-                    f"{RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s"
+                print(
+                    f"RATE LIMITED ({context}): pausing until {resume_at} ({wait.total_seconds():.0f}s)..."
                 )
-                raise RuntimeError(msg) from error
+                time.sleep(wait.total_seconds())
+                continue
 
+            if not is_transient_error(error):
+                raise
+            if attempt + 1 >= MAX_ATTEMPTS:
+                raise
+
+            attempt += 1
+            wait = _backoff_wait(attempt)
             print(
-                f"RATE LIMITED ({context}): pausing until {resume_at} ({wait.total_seconds():.0f}s)..."
+                f"WARN transient error for {context}; retry "
+                f"{attempt}/{MAX_ATTEMPTS} in {wait.total_seconds():.2f}s"
             )
             time.sleep(wait.total_seconds())
 
@@ -2064,17 +2090,30 @@ def _pause_before_retry(
     """
 
     summary.retries += 1
-    base_seconds = BASE_BACKOFF.total_seconds()
-    max_seconds = MAX_BACKOFF.total_seconds()
-    backoff_seconds = min(max_seconds, base_seconds * (2 ** (attempt - 1)))
-    backoff = dt.timedelta(seconds=backoff_seconds)
-    jitter_seconds = uniform(*(sec.total_seconds() for sec in JITTER))
-    wait = backoff + dt.timedelta(seconds=jitter_seconds)
+    wait = _backoff_wait(attempt)
     print(
         f"WARN transient error for {user.handle} ({user.did}); retry "
         + f"{attempt}/{MAX_ATTEMPTS} in {wait.total_seconds():.2f}s"
     )
     time.sleep(wait.total_seconds())
+
+
+def _backoff_wait(attempt: int) -> dt.timedelta:
+    """Compute the capped exponential backoff wait for a retry.
+
+    Args:
+        attempt: One-based retry attempt number.
+
+    Returns:
+        The backoff duration, including uniform jitter.
+    """
+
+    base_seconds = BASE_BACKOFF.total_seconds()
+    max_seconds = MAX_BACKOFF.total_seconds()
+    backoff_seconds = min(max_seconds, base_seconds * (2 ** (attempt - 1)))
+    backoff = dt.timedelta(seconds=backoff_seconds)
+    jitter_seconds = uniform(*(sec.total_seconds() for sec in JITTER))
+    return backoff + dt.timedelta(seconds=jitter_seconds)
 
 
 def _emit(msg: str, *, quiet: bool, force: bool = False) -> None:
