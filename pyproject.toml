@@ -13,17 +13,30 @@ dev = ["pyrefly", "ruff>=0.2.2", "vermin>=1.7.0"]
 [tool.ruff]
 line-length = 79
 target-version = "py312"
-src = ["bsky.py"]
+src = ["bsky.py", "test_bsky.py"]
 
 [tool.ruff.lint]
 select = [
+    # Core & Style
     "E",
-    "EM",
     "W",
     "F",
     "I",
     "N",
     "UP",
+    "YTT",
+    "Q",
+    "COM",
+    "ISC",
+    # Docstrings
+    "D",
+    "FLY",
+    # Typing & Annotations
+    "ANN",
+    "FA",
+    "PYI",
+    "TC",
+    # Correctness & Bugs
     "B",
     "A",
     "C4",
@@ -31,34 +44,63 @@ select = [
     "SIM",
     "RET",
     "ARG",
-    "EM",
     "PTH",
-    "PL",
-    "RUF",
+    "INT",
+    "SLF",
+    # Performance & Modernization
+    "PERF",
+    "FURB",
+    "SLOT",
+    # Safety, Exceptions & Quality
     "S",
     "BLE",
-    "ANN",
+    "TRY",
+    "EM",
+    "RSE",
     "ASYNC",
-    "PT",
-    "D101",
-    "D102",
-    "D103",
-    "D400",
+    "DTZ",
+    "T10",
+    "PGH",
+    "ERA",
+    "EXE",
+    "ICN",
+    "LOG",
+    "G",
+    "FBT",
+    # Pylint
+    "PL",
+    # Ruff Specific
+    "RUF",
 ]
 ignore = [
     "E501",
     "ISC001",
     "COM812",
-    "D203",
-    "D213",
     "ANN401",  # use Any in **kwargs
     "PLR0911",  # many early returns in retry state machines
     "PLR0912",  # many branches in retry state machines
     "PLR0913",
     "PLR2004",
-    "S101",
     "S311",
+    "D107",  # init docstrings are documented at class level
 ]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = ["D", "S101", "SLF001", "ANN001", "ANN201", "ANN202", "PLR2004"]
+"bsky.py" = ["T201"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-type-checking]
+strict = true
+
+[tool.ruff.lint.flake8-annotations]
+mypy-init-return = true
+suppress-none-returning = true
 
 [tool.pyrefly]
 project-includes = ["bsky.py"]

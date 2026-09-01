@@ -32,14 +32,13 @@ import json
 import os
 import sys
 import time
-from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib import metadata as importlib_metadata
 from math import isinf, isnan
 from pathlib import Path
 from random import uniform
-from typing import Any, Never, cast
+from typing import TYPE_CHECKING, Any, Never, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -52,6 +51,9 @@ from atproto.exceptions import (
     RequestException,
     UnauthorizedError,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Collection
 
 try:
     __version__ = importlib_metadata.version("bsky-starter-pack-block")
@@ -122,6 +124,10 @@ USER_AGENT = f"bsky-starter-pack-block/{__version__}"
 
 # Useful for comparisons.
 ZERO_DURATION = dt.timedelta(0)
+
+
+class RateLimitMaxWaitExceededError(Exception):
+    """Raised when a rate-limit reset exceeds the maximum wait threshold."""
 
 
 class BlockListCapError(Exception):
@@ -271,7 +277,6 @@ def confirm_destructive(count: int, action: str = "block") -> bool:
         SystemExit: With code ``2`` if stdin is not a TTY (e.g. cron / CI),
             so a destructive run is never launched silently.
     """
-
     if not sys.stdin.isatty():
         print(
             f"ERROR: refusing to {action} {count} accounts without a TTY."
@@ -311,7 +316,6 @@ def parse_delay(value: str) -> dt.timedelta:
         argparse.ArgumentTypeError: If the delay is negative, infinite, or NaN.
         ValueError: If ``value`` cannot be parsed as a float.
     """
-
     delay = float(value)
     if delay < 0:
         msg = "delay must be greater than or equal to 0"
@@ -329,7 +333,6 @@ def parse_args() -> argparse.Namespace:
         Parsed command-line arguments for login, source selection, action
         selection, throttling, output, and dry-run mode.
     """
-
     parser = argparse.ArgumentParser(
         description="Apply moderation actions to users from Bluesky starter packs or lists",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -425,7 +428,8 @@ def load_inputs_from_file(path: str) -> list[str]:
 
     The file is stat-checked first and rejected if it exceeds
     :data:`MAX_INPUT_FILE_SIZE`, so a multi-gigabyte paste cannot OOM the
-    process before the read begins.
+    process before the read begins.  Lines starting with ``#`` are treated
+    as comments and skipped.
 
     Note that this function does not normalize or validate the inputs.
     Refer to ``normalize_input_uri`` for more information.
@@ -440,7 +444,6 @@ def load_inputs_from_file(path: str) -> list[str]:
         ValueError: If the file is missing, exceeds the size cap, cannot be
             read, or contains no usable pack lines.
     """
-
     file_path = Path(path)
     try:
         size = file_path.stat().st_size
@@ -457,7 +460,12 @@ def load_inputs_from_file(path: str) -> list[str]:
 
     try:
         with file_path.open(encoding="utf-8") as fp:
-            inputs = [stripped for line in fp if (stripped := line.strip())]
+            inputs = [
+                stripped
+                for line in fp
+                if (stripped := line.strip())
+                and not stripped.startswith("#")
+            ]
     except OSError as error:
         msg = f"Could not read source file {file_path}: {error}"
         raise ValueError(msg) from error
@@ -495,7 +503,6 @@ def resolve_app_password() -> str:
         ValueError: If no password was provided and ``BSKY_APP_PASSWORD`` is not
             set.
     """
-
     env_password = os.getenv("BSKY_APP_PASSWORD")
     if not env_password:
         msg = "Missing app password. Set BSKY_APP_PASSWORD."
@@ -509,7 +516,6 @@ def supported_input_format_error() -> str:
     Returns:
         A message listing every supported starter-pack/list input format.
     """
-
     return (
         "Input must be one of: "
         "at://<did-or-handle>/app.bsky.graph.starterpack/<rkey>, "
@@ -536,7 +542,6 @@ def parse_at_uri(raw: str) -> PackReference | None:
         ValueError: If ``raw`` is an AT URI but has the wrong shape, an
             unsupported collection, or an over-long segment.
     """
-
     if not raw.startswith("at://"):
         return None
 
@@ -585,7 +590,6 @@ def parse_starter_pack_path(path_source: str) -> PackReference | None:
         ValueError: If the identifier or record key exceeds the segment
             length limit.
     """
-
     parts = [part for part in path_source.split("/") if part]
     if len(parts) != 3 or parts[0] not in SUPPORTED_STARTER_PACK_PATHS:
         return None
@@ -619,7 +623,6 @@ def parse_list_path(path_source: str) -> PackReference | None:
         ValueError: If the identifier or record key exceeds the segment
             length limit.
     """
-
     parts = [part for part in path_source.split("/") if part]
     if (
         len(parts) != 4
@@ -659,7 +662,6 @@ def parse_short_pack_path(
     Raises:
         ValueError: If the short-link code exceeds the segment length limit.
     """
-
     parts = [part for part in path_source.split("/") if part]
     if not parts:
         return None
@@ -700,7 +702,6 @@ def parse_pack_input(pack_input: str) -> PackInput:
         ValueError: If the input is empty, uses an unsupported scheme or host,
             or does not match a supported format.
     """
-
     raw = pack_input.strip()
     if not raw:
         msg = "Input cannot be empty"
@@ -770,7 +771,6 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
         RuntimeError: If the short link cannot be resolved or resolves to an
             unusable response.
     """
-
     parsed = urlparse(short_link.url)
     if parsed.scheme != "https" or parsed.hostname != BSKY_SHORT_LINK_HOST:
         msg = f"Unsupported short link URL: {short_link.url}"
@@ -796,7 +796,7 @@ def resolve_short_starter_pack_url(short_link: ShortStarterPackLink) -> str:
             if body and "application/json" in content_type:
                 raw = json.loads(body.decode("utf-8"))
                 if isinstance(raw, dict):
-                    payload = cast(dict[str, object], raw)
+                    payload = cast("dict[str, object]", raw)
                     url = payload.get("url")
                     if isinstance(url, str) and url:
                         return url
@@ -838,7 +838,6 @@ def resolve_identifier_to_did(
     Raises:
         RuntimeError: If handle resolution succeeds but does not return a DID.
     """
-
     if identifier.startswith("did:"):
         return identifier
 
@@ -876,7 +875,6 @@ def normalize_input_uri(
         RuntimeError: If short-link resolution loops too many times.
         ValueError: If the input format is unsupported.
     """
-
     current_input = source_input
     for _ in range(3):
         parsed_input = parse_pack_input(current_input)
@@ -916,7 +914,6 @@ def login(handle: str, app_password: str) -> tuple[Client, str]:
         RuntimeError: If login completes but the authenticated DID cannot be
             determined, or a rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT``.
     """
-
     client = Client()
     profile = call_with_rate_limit_retry(
         lambda: client.login(handle, app_password),
@@ -966,12 +963,10 @@ def _make_reauth_fn(
     Raises:
         AtProtocolError: If the SDK rejects the re-authentication request.
     """
-
     reauth_used = [False]
 
     def reauth() -> bool:
         """Re-authenticate once and report whether the caller can retry."""
-
         if reauth_used[0]:
             return False
         client.login(handle, app_password)
@@ -1007,7 +1002,6 @@ def fetch_starter_pack_list_uri(
         RuntimeError: If the starter pack response is missing the expected
             list data.
     """
-
     params = models.AppBskyGraphGetStarterPack.Params(starter_pack=at_uri)
     response = call_with_rate_limit_retry(
         lambda: client.app.bsky.graph.get_starter_pack(params),
@@ -1050,7 +1044,6 @@ def resolve_input_to_list_target(
             does not produce a valid AT URI.
         ValueError: If the input format is unsupported.
     """
-
     reference = normalize_input_uri(client, source_input, reauth=reauth)
     at_uri = (
         f"at://{reference.identifier}/{reference.collection}/{reference.rkey}"
@@ -1085,7 +1078,6 @@ def fetch_list_members(
         AtProtocolError: If the PDS rejects a page request.
         RuntimeError: If a rate-limit wait exceeds ``RATE_LIMIT_MAX_WAIT``.
     """
-
     members_by_did: dict[str, Member] = {}
     cursor: str | None = None
 
@@ -1106,11 +1098,11 @@ def fetch_list_members(
             if not did:
                 continue
 
-            handle = subject.handle if subject.handle else "<unknown>"
+            handle = subject.handle or "<unknown>"
             members_by_did.setdefault(did, Member(did=did, handle=handle))
 
         next_cursor = response.cursor
-        if next_cursor:
+        if next_cursor and next_cursor != cursor:
             cursor = next_cursor
             continue
         break
@@ -1130,7 +1122,6 @@ def merge_unique_members(
     Returns:
         ``None``. The function updates ``merged`` in place.
     """
-
     for member in new_members:
         merged.setdefault(member.did, member)
 
@@ -1173,7 +1164,6 @@ def fetch_block_records(
         RuntimeError: If a rate-limit response requires a wait longer than
             ``RATE_LIMIT_MAX_WAIT``.
     """
-
     records_by_did: dict[str, str] = {}
     cursor: str | None = None
 
@@ -1193,7 +1183,7 @@ def fetch_block_records(
                 records_by_did[did] = uri
 
         next_cursor = response.cursor
-        if next_cursor:
+        if next_cursor and next_cursor != cursor:
             cursor = next_cursor
             continue
         break
@@ -1213,7 +1203,6 @@ def block_record_key(uri: str) -> str:
     Raises:
         ValueError: If ``uri`` does not have the expected AT URI shape.
     """
-
     parts = uri.split("/")
     if (
         len(parts) != 5
@@ -1239,7 +1228,6 @@ def current_time_iso(client: Client) -> str:
     Returns:
         Current UTC time as an RFC 3339 timestamp.
     """
-
     get_current_time_iso = getattr(client, "get_current_time_iso", None)
     if callable(get_current_time_iso):
         value = get_current_time_iso()
@@ -1291,7 +1279,6 @@ def _record_action_failure(
     Returns:
         ``None``. The function updates ``summary`` and ``failures`` in place.
     """
-
     summary.failed += 1
     failures.append(f"{action.value} {user.handle} ({user.did})")
     message = describe_error(error)
@@ -1341,7 +1328,6 @@ def _apply_action_once(
         AtProtocolError: If the PDS rejects the request. The caller handles
             retries and authentication recovery.
     """
-
     response: bool
     match action:
         case ModerationAction.BLOCK:
@@ -1411,7 +1397,6 @@ def _apply_action_with_retries(
     Raises:
         BlockListCapError: If a block request reaches the account block cap.
     """
-
     attempt = 0
     while attempt < MAX_ATTEMPTS:
         try:
@@ -1476,6 +1461,7 @@ def _apply_action_with_retries(
 
             attempt += 1
             rate_limit_result = _pause_for_rate_limit_if_needed(
+                action=action,
                 error=error,
                 user=user,
                 summary=summary,
@@ -1483,7 +1469,7 @@ def _apply_action_with_retries(
                 is_quiet=is_quiet,
             )
             if rate_limit_result is False:
-                return ActionOutcome.FAILED
+                raise RateLimitMaxWaitExceededError from error
             if rate_limit_result is True:
                 continue
 
@@ -1540,7 +1526,6 @@ def _count_action_targets(
     Returns:
         Number of accounts that can receive a write or a dry-run action.
     """
-
     return sum(
         1
         for user in users
@@ -1598,7 +1583,6 @@ def apply_users(
     Returns:
         A result with counters, failures, skipped entries, and cap status.
     """
-
     summary.discovered = len(users)
     failures: list[str] = []
     skipped: list[str] = []
@@ -1681,6 +1665,14 @@ def apply_users(
             )
             break
 
+        except RateLimitMaxWaitExceededError:
+            _emit(
+                "Aborting: rate limit exceeds maximum wait time.",
+                quiet=is_quiet,
+                force=True,
+            )
+            break
+
         if outcome is ActionOutcome.APPLIED:
             summary.applied += 1
             _emit(
@@ -1720,7 +1712,6 @@ def extract_status_code(error: Exception) -> int | None:
     Returns:
         The HTTP status code if available, otherwise ``None``.
     """
-
     response = getattr(error, "response", None)
     if response is None:
         return None
@@ -1736,23 +1727,23 @@ def extract_response_headers(error: Exception) -> dict[str, Any]:
 
     The atproto SDK normalizes response headers to a lowercase-keyed
     ``dict[str, str]`` (see ``atproto_client.request._convert_headers_to_dict``),
-    but the public type is ``dict[str, Any]``; this function preserves that type
-    so callers do not have to cast.
+    but the public type is ``dict[str, Any]``.  Keys are lowercased here as a
+    defense-in-depth measure against proxies or SDK versions that skip
+    normalization.
 
     Args:
         error: Exception raised by the AT Protocol client or network layer.
 
     Returns:
-        The response headers dict, or an empty dict when unavailable.
+        A lowercase-keyed headers dict, or an empty dict when unavailable.
     """
-
     response = getattr(error, "response", None)
     if response is None:
         return {}
 
     headers = getattr(response, "headers", None)
     if isinstance(headers, dict):
-        return headers
+        return {str(k).lower(): v for k, v in headers.items()}
     return {}
 
 
@@ -1770,7 +1761,6 @@ def extract_rate_limit_wait(error: Exception) -> dt.timedelta | None:
         Duration to wait (including buffer), or ``None`` when no usable
         rate-limit timing is available in the response.
     """
-
     headers = extract_response_headers(error)
     if not headers:
         return None
@@ -1816,7 +1806,6 @@ def describe_error(error: Exception) -> str:
     Returns:
         The exception text, prefixed with an HTTP status code when available.
     """
-
     status_code = extract_status_code(error)
     if status_code is None:
         return str(error)
@@ -1841,7 +1830,6 @@ def is_transient_error(error: BaseException) -> bool:
     Returns:
         ``True`` for transient failures; ``False`` otherwise.
     """
-
     if isinstance(error, NetworkError):
         return True
 
@@ -1871,7 +1859,6 @@ def is_block_list_cap_error(error: BaseException) -> bool:
     Returns:
         ``True`` when the error is the block-list-cap error, otherwise ``False``.
     """
-
     response = getattr(error, "response", None)
     content = (
         getattr(response, "content", None) if response is not None else None
@@ -1915,6 +1902,8 @@ def is_input_unrecoverable(error: BaseException) -> bool:
 
     - ``BadRequestError`` (HTTP 400: bad rkey, deleted record, etc.)
     - ``RequestException`` with status 404 (record not found / deleted)
+    - ``RuntimeError`` caused by an ``HTTPError`` with code 404 (e.g. an
+      expired or deleted short link)
 
     Args:
         error: Exception raised by the AT Protocol client.
@@ -1923,11 +1912,14 @@ def is_input_unrecoverable(error: BaseException) -> bool:
         ``True`` when the input source is permanently broken and the
         caller should skip it and continue.
     """
-
     if isinstance(error, BadRequestError):
         return True
     if isinstance(error, RequestException):
         return extract_status_code(error) == 404
+    if isinstance(error, RuntimeError):
+        cause = error.__cause__
+        if isinstance(cause, HTTPError):
+            return cause.code == 404
     return False
 
 
@@ -1967,7 +1959,6 @@ def call_with_rate_limit_retry[T](
             ``RATE_LIMIT_MAX_WAIT``.
         Exception: The last failure after transient retries are exhausted.
     """
-
     attempt = 0
     while True:
         try:
@@ -2019,6 +2010,7 @@ def call_with_rate_limit_retry[T](
 
 def _pause_for_rate_limit_if_needed(
     *,
+    action: ModerationAction,
     error: Exception,
     user: Member,
     summary: ModerationSummary,
@@ -2028,6 +2020,7 @@ def _pause_for_rate_limit_if_needed(
     """Pause for a rate-limit response when retry timing is available.
 
     Args:
+        action: Moderation action in progress.
         error: Exception raised by the moderation operation.
         user: Account receiving the moderation operation.
         summary: Mutable run summary updated with retry or failure counts.
@@ -2040,7 +2033,6 @@ def _pause_for_rate_limit_if_needed(
         ``False`` when the wait was too long and the user was recorded as
         failed, or ``None`` when the error is not a usable rate-limit response.
     """
-
     status_code = extract_status_code(error)
     if status_code != HTTP_STATUS_TOO_MANY_REQUESTS:
         return None
@@ -2056,13 +2048,13 @@ def _pause_for_rate_limit_if_needed(
     if rate_limit_wait > RATE_LIMIT_MAX_WAIT:
         _emit(
             f"ERROR rate limit for {user.handle} ({user.did}) resets at {resume_at}"
-            + f" ({rate_limit_wait.total_seconds():.0f}s), exceeds max wait of"
-            + f" {RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s — aborting",
+            f" ({rate_limit_wait.total_seconds():.0f}s), exceeds max wait of"
+            f" {RATE_LIMIT_MAX_WAIT.total_seconds():.0f}s — aborting",
             quiet=is_quiet,
             force=True,
         )
         summary.failed += 1
-        failures.append(f"{user.handle} ({user.did})")
+        failures.append(f"{action.value} {user.handle} ({user.did})")
         return False
 
     _emit(
@@ -2088,12 +2080,11 @@ def _pause_before_retry(
         user: Account receiving the moderation action.
         summary: Mutable run summary updated with the retry count.
     """
-
     summary.retries += 1
     wait = _backoff_wait(attempt)
     print(
         f"WARN transient error for {user.handle} ({user.did}); retry "
-        + f"{attempt}/{MAX_ATTEMPTS} in {wait.total_seconds():.2f}s"
+        f"{attempt}/{MAX_ATTEMPTS} in {wait.total_seconds():.2f}s"
     )
     time.sleep(wait.total_seconds())
 
@@ -2107,7 +2098,6 @@ def _backoff_wait(attempt: int) -> dt.timedelta:
     Returns:
         The backoff duration, including uniform jitter.
     """
-
     base_seconds = BASE_BACKOFF.total_seconds()
     max_seconds = MAX_BACKOFF.total_seconds()
     backoff_seconds = min(max_seconds, base_seconds * (2 ** (attempt - 1)))
@@ -2132,7 +2122,6 @@ def _emit(msg: str, *, quiet: bool, force: bool = False) -> None:
     Returns:
         ``None``.
     """
-
     if not quiet or force:
         print(msg)
 
@@ -2168,7 +2157,6 @@ def _print_progress(
     Returns:
         ``None``.
     """
-
     if is_quiet or PROGRESS_EVERY <= 0 or total <= 0:
         return
     if completed == 0 or completed % PROGRESS_EVERY != 0:
@@ -2195,7 +2183,6 @@ def load_source_inputs(args: argparse.Namespace) -> list[str]:
     Raises:
         ValueError: If the selected source file cannot be read or is empty.
     """
-
     if args.input is not None:
         return [args.input]
     return load_inputs_from_file(args.file)
@@ -2223,7 +2210,6 @@ def load_members_from_sources(
             be recovered by the input skip rules.
         RuntimeError: If source resolution exceeds a retry or wait limit.
     """
-
     merged: dict[str, Member] = {}
     skipped_inputs: list[str] = []
     for source_input in source_inputs:
@@ -2282,7 +2268,6 @@ def load_action_records(
         A mapping from target DID to block record URI for block actions and
         unblock actions. Other actions return an empty mapping.
     """
-
     if action in {ModerationAction.BLOCK, ModerationAction.UNBLOCK}:
         return fetch_block_records(client, self_did, reauth=reauth)
     return {}
@@ -2313,7 +2298,6 @@ def confirm_action(
     Raises:
         SystemExit: With code 2 if the user declines or no TTY exists.
     """
-
     target_count = _count_action_targets(
         action,
         users,
@@ -2355,7 +2339,6 @@ def execute_moderation(
     Returns:
         The moderation result returned by ``apply_users``.
     """
-
     result = apply_users(
         client,
         action=options.action,
@@ -2369,7 +2352,7 @@ def execute_moderation(
         reauth=reauth,
         summary=summary,
     )
-    print_summary(result, options.action, options.dry_run)
+    print_summary(result, options.action, dry_run=options.dry_run)
     return result
 
 
@@ -2383,7 +2366,6 @@ def exit_code_for_result(result: ModerationResult) -> int:
         ``3`` for a block-list cap, ``1`` for other failures, or ``0`` for
         a run without failures.
     """
-
     if result.cap_reached:
         return 3
     if result.summary.failed > 0:
@@ -2394,6 +2376,7 @@ def exit_code_for_result(result: ModerationResult) -> int:
 def print_summary(
     result: ModerationResult,
     action: ModerationAction,
+    *,
     dry_run: bool,
 ) -> None:
     """Print one summary format for every moderation action.
@@ -2406,7 +2389,6 @@ def print_summary(
     Returns:
         ``None``.
     """
-
     summary = result.summary
     subject = "Members" if action is ModerationAction.BLOCK else "Accounts"
     print("\nSummary")
@@ -2463,7 +2445,6 @@ def main() -> None:
     Raises:
         SystemExit: When the exit code is non-zero.
     """
-
     args = parse_args()
     options = ModerationOptions(
         action=args.action,

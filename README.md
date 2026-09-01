@@ -135,7 +135,8 @@ Use `--quiet` to suppress per-account lines. The script prints only operational 
 uv run python bsky.py --input "<starter-pack-or-list-link>" --no-dry-run --quiet
 ```
 
-Use more than one source by putting one input per line in a file:
+Use more than one source by putting one input per line in a file. Lines that
+start with `#` are comments and are ignored:
 
 ```bash
 uv run python bsky.py --file inputs.txt --dry-run --verbose
@@ -146,7 +147,7 @@ uv run python bsky.py --file inputs.txt --dry-run --verbose
 | Flag | Description |
 | --- | --- |
 | `-i`/`--input` | Single starter-pack/list URL or AT URI (mutually exclusive with `--file`). |
-| `-f`/`--file` | UTF-8 text file with one URL/AT URI per line (max 10 MiB). |
+| `-f`/`--file` | UTF-8 text file with one URL/AT URI per line (max 10 MiB). Lines that start with `#` are comments. |
 | `--mute` | Mute each selected account. |
 | `--unmute` | Unmute each selected account. |
 | `--unblock` | Delete matching block records for selected accounts. |
