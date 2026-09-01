@@ -38,7 +38,7 @@ from importlib import metadata as importlib_metadata
 from math import isinf, isnan
 from pathlib import Path
 from random import uniform
-from typing import TYPE_CHECKING, Any, Never, cast
+from typing import TYPE_CHECKING, Any, Final, Never, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -60,70 +60,70 @@ try:
 except importlib_metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
-STARTER_PACK_COLLECTION = "app.bsky.graph.starterpack"
-LIST_COLLECTION = "app.bsky.graph.list"
-BLOCK_COLLECTION = "app.bsky.graph.block"
-SUPPORTED_STARTER_PACK_PATHS = {"start", "starter-pack"}
-PROFILE_PATH_SEGMENT = "profile"
-LISTS_PATH_SEGMENT = "lists"
-BSKY_APP_HOSTS = {"bsky.app", "www.bsky.app"}
-BSKY_SHORT_LINK_HOST = "go.bsky.app"
-STARTER_PACK_SHORT_PATH = "starter-pack-short"
+STARTER_PACK_COLLECTION: Final = "app.bsky.graph.starterpack"
+LIST_COLLECTION: Final = "app.bsky.graph.list"
+BLOCK_COLLECTION: Final = "app.bsky.graph.block"
+SUPPORTED_STARTER_PACK_PATHS: Final = {"start", "starter-pack"}
+PROFILE_PATH_SEGMENT: Final = "profile"
+LISTS_PATH_SEGMENT: Final = "lists"
+BSKY_APP_HOSTS: Final = {"bsky.app", "www.bsky.app"}
+BSKY_SHORT_LINK_HOST: Final = "go.bsky.app"
+STARTER_PACK_SHORT_PATH: Final = "starter-pack-short"
 
 # Socket timeout for urllib when resolving short links (go.bsky.app redirects).
-SHORT_LINK_TIMEOUT = dt.timedelta(seconds=10.0)
+SHORT_LINK_TIMEOUT: Final = dt.timedelta(seconds=10.0)
 
 # Maximum size of the input file in bytes; anything larger is rejected before
 # opening so a 5GB paste cannot OOM the process.
-MAX_INPUT_FILE_SIZE = 10 * 1024 * 1024  # 10 MiB
+MAX_INPUT_FILE_SIZE: Final = 10 * 1024 * 1024  # 10 MiB
 
 # Maximum length of a single AT URI segment (identifier, rkey). Keeps a
 # hostile 1MB identifier from making the parser do useless work.
-MAX_AT_URI_SEGMENT_LENGTH = 512
+MAX_AT_URI_SEGMENT_LENGTH: Final = 512
 
 # A progress line is emitted to stderr every N successful moderation actions
 # (or, in dry-run, every N planned actions). Set to 0 to disable output.
-PROGRESS_EVERY = 25
+PROGRESS_EVERY: Final = 25
 
 # Maximum records per page for listRepos/listRecords-style reads.
-LIST_PAGE_SIZE = 100
+LIST_PAGE_SIZE: Final = 100
 
 # Same pagination limit when enumerating existing blocks to skip already-blocked DIDs.
-BLOCKS_PAGE_SIZE = 100
+BLOCKS_PAGE_SIZE: Final = 100
 
 # Successful moderation actions are followed by ``time.sleep(delay)``.
 # This is the CLI default when ``--delay`` is omitted.
-DEFAULT_DELAY = dt.timedelta(seconds=0.5)
+DEFAULT_DELAY: Final = dt.timedelta(seconds=0.5)
 
 # Attempts per account use capped exponential backoff and jitter.
-MAX_ATTEMPTS = 5  # Total attempts (initial + retries) per account.
+MAX_ATTEMPTS: Final = 5  # Total attempts (initial + retries) per account.
 # Wait ``min(MAX, BASE * 2**(attempt - 1))`` seconds before each retry.
-BASE_BACKOFF = dt.timedelta(seconds=1.0)
+BASE_BACKOFF: Final = dt.timedelta(seconds=1.0)
 # Upper bound so backoff does not grow past a lot.
-MAX_BACKOFF = dt.timedelta(seconds=8.0)
+MAX_BACKOFF: Final = dt.timedelta(seconds=8.0)
 
 # Uniform random extra delay on each backoff (seconds), reduces synchronized retries.
-JITTER = (dt.timedelta(seconds=0.0), dt.timedelta(seconds=0.6))
+JITTER: Final = (dt.timedelta(seconds=0.0), dt.timedelta(seconds=0.6))
 
 # HTTP response codes treated as retryable alongside network errors (see ``is_transient_error``).
-HTTP_STATUS_TOO_MANY_REQUESTS = 429
+HTTP_STATUS_TOO_MANY_REQUESTS: Final = 429
 # Any status greater than or equal to this is treated as a transient server error.
-HTTP_STATUS_SERVER_ERROR_MIN = 500
+HTTP_STATUS_SERVER_ERROR_MIN: Final = 500
 
 # Rate-limit pause: small buffer added to the computed wait so the retry lands after the window resets.
-RATE_LIMIT_BUFFER = dt.timedelta(seconds=2.0)
+RATE_LIMIT_BUFFER: Final = dt.timedelta(seconds=2.0)
 # If the server asks to wait longer than this, abort instead of blocking the terminal.
-RATE_LIMIT_MAX_WAIT = dt.timedelta(hours=3)
+RATE_LIMIT_MAX_WAIT: Final = dt.timedelta(hours=3)
 # XRPC error code returned by the PDS when the user has hit the maximum
 # per-account block list size. Used to abort the run with a clear message
 # instead of retrying forever.
-BLOCK_LIST_CAP_ERROR_CODE = "BlockedAccountCountLimitExceeded"
+BLOCK_LIST_CAP_ERROR_CODE: Final = "BlockedAccountCountLimitExceeded"
 # User agent sent when resolving short links. Identifies the script by name
 # and version so the short-link service can apply appropriate rate limits.
-USER_AGENT = f"bsky-starter-pack-block/{__version__}"
+USER_AGENT: Final = f"bsky-starter-pack-block/{__version__}"
 
 # Useful for comparisons.
-ZERO_DURATION = dt.timedelta(0)
+ZERO_DURATION: Final = dt.timedelta(0)
 
 
 class RateLimitMaxWaitExceededError(Exception):
@@ -261,6 +261,14 @@ class ActionOutcome(StrEnum):
     APPLIED = "applied"
     SKIPPED_INVALID = "skipped_invalid"
     FAILED = "failed"
+
+
+class RateLimitPauseOutcome(StrEnum):
+    """Outcome of rate-limit inspection and pause."""
+
+    PAUSED = "paused"
+    MAX_WAIT_EXCEEDED = "max_wait_exceeded"
+    NOT_RATE_LIMITED = "not_rate_limited"
 
 
 def confirm_destructive(count: int, action: str = "block") -> bool:
@@ -963,14 +971,15 @@ def _make_reauth_fn(
     Raises:
         AtProtocolError: If the SDK rejects the re-authentication request.
     """
-    reauth_used = [False]
+    reauth_used = False
 
     def reauth() -> bool:
         """Re-authenticate once and report whether the caller can retry."""
-        if reauth_used[0]:
+        nonlocal reauth_used
+        if reauth_used:
             return False
         client.login(handle, app_password)
-        reauth_used[0] = True
+        reauth_used = True
         summary.reauths += 1
         _emit(
             "INFO: re-authenticated (session expired)",
@@ -1328,7 +1337,6 @@ def _apply_action_once(
         AtProtocolError: If the PDS rejects the request. The caller handles
             retries and authentication recovery.
     """
-    response: bool
     match action:
         case ModerationAction.BLOCK:
             record_response = client.app.bsky.graph.block.create(
@@ -1338,28 +1346,27 @@ def _apply_action_once(
                     created_at=current_time_iso(client),
                 ),
             )
-            response = bool(getattr(record_response, "cid", None))
+            return bool(getattr(record_response, "cid", None))
 
         case ModerationAction.MUTE:
-            response = client.mute(user.did)
+            return client.mute(user.did) is not False
         case ModerationAction.UNMUTE:
-            response = client.unmute(user.did)
+            return client.unmute(user.did) is not False
         case ModerationAction.UNBLOCK:
             if block_record_uri is None:
                 msg = f"No block record found for {user.did}"
                 raise RuntimeError(msg)
-            response = client.app.bsky.graph.block.delete(
-                self_did,
-                block_record_key(block_record_uri),
+            return (
+                client.app.bsky.graph.block.delete(
+                    self_did,
+                    block_record_key(block_record_uri),
+                )
+                is not False
             )
         case _:
             unreachable: Never = action
             msg = f"Unsupported moderation action: {unreachable}"
             raise ValueError(msg)
-
-    # The SDK models these void procedures as bool. Treat an older or mocked
-    # client returning None as success when the request itself did not fail.
-    return response is not False
 
 
 def _apply_action_with_retries(
@@ -1468,9 +1475,9 @@ def _apply_action_with_retries(
                 failures=failures,
                 is_quiet=is_quiet,
             )
-            if rate_limit_result is False:
+            if rate_limit_result is RateLimitPauseOutcome.MAX_WAIT_EXCEEDED:
                 raise RateLimitMaxWaitExceededError from error
-            if rate_limit_result is True:
+            if rate_limit_result is RateLimitPauseOutcome.PAUSED:
                 continue
 
             _pause_before_retry(
@@ -2016,7 +2023,7 @@ def _pause_for_rate_limit_if_needed(
     summary: ModerationSummary,
     failures: list[str],
     is_quiet: bool = False,
-) -> bool | None:
+) -> RateLimitPauseOutcome:
     """Pause for a rate-limit response when retry timing is available.
 
     Args:
@@ -2029,17 +2036,15 @@ def _pause_for_rate_limit_if_needed(
         is_quiet: When ``True``, suppress the per-user "aborting" error line.
 
     Returns:
-        ``True`` when the caller should retry immediately after the pause,
-        ``False`` when the wait was too long and the user was recorded as
-        failed, or ``None`` when the error is not a usable rate-limit response.
+        The outcome of the rate-limit inspection and optional pause.
     """
     status_code = extract_status_code(error)
     if status_code != HTTP_STATUS_TOO_MANY_REQUESTS:
-        return None
+        return RateLimitPauseOutcome.NOT_RATE_LIMITED
 
     rate_limit_wait = extract_rate_limit_wait(error)
     if rate_limit_wait is None:
-        return None
+        return RateLimitPauseOutcome.NOT_RATE_LIMITED
 
     resume_at = dt.datetime.fromtimestamp(
         time.time() + rate_limit_wait.total_seconds(),
@@ -2055,7 +2060,7 @@ def _pause_for_rate_limit_if_needed(
         )
         summary.failed += 1
         failures.append(f"{action.value} {user.handle} ({user.did})")
-        return False
+        return RateLimitPauseOutcome.MAX_WAIT_EXCEEDED
 
     _emit(
         f"RATE LIMITED: pausing until {resume_at} ({rate_limit_wait.total_seconds():.0f}s)...",
@@ -2064,7 +2069,7 @@ def _pause_for_rate_limit_if_needed(
     )
     time.sleep(rate_limit_wait.total_seconds())
     summary.retries += 1
-    return True
+    return RateLimitPauseOutcome.PAUSED
 
 
 def _pause_before_retry(
